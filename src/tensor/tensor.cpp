@@ -164,42 +164,159 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    TO_BE_IMPLEMENTED();
+    size_t z = 1;
+    for(int i = _meta.shape.size() - 1; i >= 0 ; i--){
+        if(_meta.shape[i] != 1){
+            if(_meta.strides[i]!= static_cast<ptrdiff_t>(z)) return false;
+            z *= _meta.shape[i];
+        }
+    }
     return true;
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (order.size() != this->ndim()) {
+        throw std::runtime_error("order不合法");
+    }
+    std::vector<size_t> new_shape;
+    std::vector<ptrdiff_t> new_strides;
+    for (size_t i : order) {
+        new_shape.push_back(_meta.shape[i]);
+        new_strides.push_back(_meta.strides[i]);
+    }
+    TensorMeta new_meta{_meta.dtype, new_shape, new_strides};
+    return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage, _offset));
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    std::cout << "DEBUG: C++ view called!" << std::endl;
+    std::cout << "DEBUG: Input shape size: " << shape.size() << std::endl;
+    if (!isContiguous()) {
+        throw std::runtime_error("tensor不连续");
+    }
+    size_t new_numel = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>()); 
+    //标准库内accumulate：累积
+    if (new_numel != this->numel()) {
+        throw std::runtime_error("元素数量不同");
+    }
+
+    //数据没变，只是把shape改了后根据新shape创建新步长
+    std::vector<ptrdiff_t> new_strides(shape.size());
+    size_t stride = 1;
+    for (int i = shape.size() - 1; i >= 0; i--) {
+        new_strides[i] = stride;
+        stride *= shape[i];
+    }
+
+    TensorMeta new_meta = {_meta.dtype, shape, new_strides}; //保留了原数据_meta.dtype的情况下，使用新shape和new_strides
+    return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage, _offset));
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (dim >= ndim()) {
+        throw std::runtime_error("维度超过");
+    }
+    if (start >= end || end > _meta.shape[dim]) {
+        throw std::runtime_error("范围超过");
+    }
+    TensorMeta new_meta = _meta;
+    new_meta.shape[dim] = end - start;
+    size_t added_offset = start * _meta.strides[dim] * elementSize();
+    return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage, _offset + added_offset));
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    if(!isContiguous()){
+        throw std::runtime_error("tensor不连续");
+    }
+    size_t size_in_byte = numel() * elementSize(); //计算要多少字节 tensor中的元素数 * 字节数
+    
+    if(deviceType() == LLAISYS_DEVICE_CPU){
+        std::memcpy(data(), src_, size_in_byte);
+    }else{
+        core::context().setDevice(deviceType(), deviceId());//显式设置当前 CPU 线程的上下文（Context），使其绑定到指定的硬件设备上。
+        core::context().runtime().api()->memcpy_sync(
+            data(),             // 目标：GPU 显存地址
+            src_,                // 源：用户传入的 CPU 指针
+            size_in_byte,      // 大小
+            LLAISYS_MEMCPY_H2D  // 方向：主机到设备
+        );
+    }
 }
-
+namespace{
+    void copy_strided_cpu(const std::byte* src, std::byte* dst, 
+                          const std::vector<size_t>& shape, 
+                          const std::vector<ptrdiff_t>& strides, 
+                          size_t elem_size, size_t dim, size_t& dst_offset){ //dst_offset是写入字节的游标
+        if(dim == shape.size() - 1){ //如果递归终止，进行拷贝数据
+            for(size_t i = 0; i < shape[dim]; ++i){
+                std::memcpy(dst + dst_offset, src + i * strides[dim] * elem_size, elem_size); //strides[dim] * elem_size当前维度的步长*字节数，src是起始位置，i是步数
+                dst_offset += elem_size;//dst是起始位置，dst_offset是字节数，相当于src每一步跳strides[dim] * elem_size，但是dst只往下进行一次，顺序写入
+            }
+        }else{
+            for(size_t i = 0; i < shape[dim]; ++i){
+                copy_strided_cpu(src + i * strides[dim] * elem_size, dst, shape, strides, elem_size, dim + 1, dst_offset);
+            }
+        }
+    }
+}
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if(isContiguous()) return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+
+    auto res = create(_meta.shape, _meta.dtype, deviceType(), deviceId());
+    if(deviceType() == LLAISYS_DEVICE_CPU){
+        size_t dst_offset = 0; //游标从0开始
+        copy_strided_cpu(this->data(), res->data(), _meta.shape, _meta.strides, elementSize(), 0, dst_offset); //这里dim用的0，是因为copy_strided_cpu是个递归函数，从 0 递归到 shape.size() - 1
+    }else {
+        
+        size_t raw_size = _storage->size();
+        auto cpu_storage = core::context().runtime().allocateHostStorage(raw_size);
+        core::context().setDevice(deviceType(), deviceId());
+        core::context().runtime().api()->memcpy_sync(
+            cpu_storage->memory(), 
+            _storage->memory(), 
+            raw_size, 
+            LLAISYS_MEMCPY_D2H
+        );
+
+        auto cpu_mirror = std::shared_ptr<Tensor>(new Tensor(_meta, cpu_storage, _offset));
+        auto cpu_contig = cpu_mirror->contiguous();
+        res = cpu_contig->to(deviceType(), deviceId());
+
+    }
+    return res;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    return this -> contiguous() -> view(shape);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if(!isContiguous()){
+        return this -> contiguous() -> to(device_type, device);
+    }
+    auto res = Tensor::create(_meta.shape, _meta.dtype, device_type, device);
+    llaisysMemcpyKind_t kind;
+    if (deviceType() == LLAISYS_DEVICE_CPU && device_type != LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2D; // CPU -> GPU
+    } else if (deviceType() != LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_D2H; // GPU -> CPU
+    } else {
+        kind = LLAISYS_MEMCPY_D2D; // GPU -> GPU (或者 CPU->CPU)
+    }
+    // 切换到目标设备的上下文（最佳实践：通常在目标设备上发起接收指令比较稳妥）
+    core::context().setDevice(device_type, device);
+    
+    // 计算大小
+    size_t size_in_bytes = numel() * elementSize();
+
+    core::context().runtime().api()->memcpy_sync(
+        res->data(),    // 目标地址
+        this->data(),   // 源地址
+        size_in_bytes,  // 字节数
+        kind            // 方向
+    );
+    return res;
 }
 
 } // namespace llaisys

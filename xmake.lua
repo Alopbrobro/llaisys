@@ -105,7 +105,13 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    
+    -- 原有的接口文件
     add_files("src/llaisys/*.cc")
+    
+    -- 【关键修复】添加这一行以编译 Qwen2 模型实现
+    add_files("src/llaisys/models/*.cpp")
+
     set_installdir(".")
 
     
