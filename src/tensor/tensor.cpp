@@ -165,9 +165,9 @@ void Tensor::debug() const {
 
 bool Tensor::isContiguous() const {
     size_t z = 1;
-    for(int i = _meta.shape.size() - 1; i >= 0 ; i--){
-        if(_meta.shape[i] != 1){
-            if(_meta.strides[i]!= static_cast<ptrdiff_t>(z)) return false;
+    for (size_t i = _meta.shape.size(); i-- > 0;) {
+        if (_meta.shape[i] != 1) {
+            if (_meta.strides[i] != static_cast<ptrdiff_t>(z)) return false;
             z *= _meta.shape[i];
         }
     }
@@ -194,7 +194,7 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
     if (!isContiguous()) {
         throw std::runtime_error("tensor不连续");
     }
-    size_t new_numel = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>()); 
+    size_t new_numel = std::accumulate(shape.begin(), shape.end(), static_cast<size_t>(1), std::multiplies<size_t>());
     //标准库内accumulate：累积
     if (new_numel != this->numel()) {
         throw std::runtime_error("元素数量不同");
@@ -203,8 +203,8 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
     //数据没变，只是把shape改了后根据新shape创建新步长
     std::vector<ptrdiff_t> new_strides(shape.size());
     size_t stride = 1;
-    for (int i = shape.size() - 1; i >= 0; i--) {
-        new_strides[i] = stride;
+    for (size_t i = shape.size(); i-- > 0;) {
+        new_strides[i] = static_cast<ptrdiff_t>(stride);
         stride *= shape[i];
     }
 
