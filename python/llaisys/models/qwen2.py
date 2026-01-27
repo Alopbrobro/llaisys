@@ -107,8 +107,10 @@ class Qwen2:
     ):
         if not inputs:
             return []
-            
-        output_ids = []
+
+        # test/test_infer.py expects the returned token list to include the prompt
+        # (HF model.generate returns [prompt + generated]).
+        output_ids = list(inputs)
         max_tokens = max_new_tokens if max_new_tokens is not None else 20
         
         # --- 1. Prefill ---
@@ -128,8 +130,8 @@ class Qwen2:
         
         # 调用推理
         next_token = model_infer(self.model_handle, input_ptr, ctypes.c_size_t(input_len))
-        
-        output_ids.append(next_token)
+
+        output_ids.append(int(next_token))
         current_token = next_token
         
         # --- 2. Decoding ---
@@ -139,8 +141,8 @@ class Qwen2:
             token_ptr = token_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
             
             next_token = model_infer(self.model_handle, token_ptr, ctypes.c_size_t(1))
-            
-            output_ids.append(next_token)
+
+            output_ids.append(int(next_token))
             current_token = next_token
             
             if next_token == 151643: # EOS
