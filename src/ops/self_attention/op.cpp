@@ -66,12 +66,12 @@ void self_attention_cpu_kernel(tensor_t attn_val, tensor_t q, tensor_t k, tensor
                 if (A[j] == -std::numeric_limits<float>::infinity()) {
                     A[j] = 0.0f;
                 } else {
-                    A[j] = std::exp(A[j] - max_score);
+                    A[j] = static_cast<float>(std::exp(static_cast<double>(A[j] - max_score)));
                 }
                 sum += A[j];
             }
 
-            float inv_sum = 1.0f / (sum + 1e-6f);
+            float inv_sum = 1.0f / (static_cast<float>(sum) + 1e-6f);
             for (int64_t j = 0; j < total_len; j ++) {
                 A[j] *= inv_sum; 
             }
