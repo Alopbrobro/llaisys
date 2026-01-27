@@ -58,3 +58,4 @@ jobs:
     - name: Assignment-3
       run: |
         python test/test_infer.py --test
+        # Force trigger CI
