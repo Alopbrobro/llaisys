@@ -189,8 +189,6 @@ tensor_t Tensor::permute(const std::vector<size_t> &order) const {
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    std::cout << "DEBUG: C++ view called!" << std::endl;
-    std::cout << "DEBUG: Input shape size: " << shape.size() << std::endl;
     if (!isContiguous()) {
         throw std::runtime_error("tensor不连续");
     }

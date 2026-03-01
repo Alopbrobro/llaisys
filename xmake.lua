@@ -102,6 +102,14 @@ target("llaisys")
     add_deps("llaisys-core")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
+    if has_config("nv-gpu") then
+        add_links("cublas", "cudart")
+        add_linkdirs("/usr/local/cuda/lib64")
+        set_toolset("cu", "nvcc")
+        add_cuflags("-Xcompiler=-fPIC")
+        add_files("src/device/nvidia/*.cu")
+        add_files("src/ops/*/nvidia/*.cu")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")

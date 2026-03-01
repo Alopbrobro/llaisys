@@ -1,5 +1,9 @@
 #include "op.hpp"
 
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/rope_nvidia.cuh"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void rope_cpu_kernel(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {// out、in:[seqlen, nhead, d]张量是连续的, pos_ids: [seqlen,] dtype是int64
@@ -57,6 +61,13 @@ void rope_cpu_kernel(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
 
 void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
     auto dtype = in->dtype();
+
+#ifdef ENABLE_NVIDIA_API
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+        return nvidia::rope(out, in, pos_ids, theta);
+    }
+#endif
+
     if (dtype == llaisysDataType_t::LLAISYS_DTYPE_F32) {
         rope_cpu_kernel<float>(out, in, pos_ids, theta);
     } 

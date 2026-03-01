@@ -1,5 +1,9 @@
 #include "op.hpp"
 
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/embedding_nvidia.cuh"
+#endif
+
 namespace llaisys::ops {
 
 template<typename T>
@@ -28,6 +32,13 @@ void embedding_cpu_kernel(tensor_t out, tensor_t index, tensor_t weight) {
 
 void embedding(tensor_t out, tensor_t index, tensor_t weight) {
     auto dtype = weight->dtype();
+
+#ifdef ENABLE_NVIDIA_API
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+        return nvidia::embedding(out, index, weight);
+    }
+#endif
+
     if (dtype == llaisysDataType_t::LLAISYS_DTYPE_F32) {
         embedding_cpu_kernel<float>(out, index, weight);
     } 

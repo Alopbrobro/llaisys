@@ -1,5 +1,9 @@
 #include "op.hpp"
 
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/self_attention_nvidia.cuh"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void self_attention_cpu_kernel(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {//1、A = Q * K ^ T  2、softmax(A) 3、softmax(A) * V
@@ -95,6 +99,13 @@ void self_attention_cpu_kernel(tensor_t attn_val, tensor_t q, tensor_t k, tensor
 
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
     auto dtype = q->dtype();
+
+#ifdef ENABLE_NVIDIA_API
+    if (attn_val->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+        return nvidia::self_attention(attn_val, q, k, v, scale);
+    }
+#endif
+
     if (dtype == llaisysDataType_t::LLAISYS_DTYPE_F32) {
         self_attention_cpu_kernel<float>(attn_val, q, k, v, scale);
     } 

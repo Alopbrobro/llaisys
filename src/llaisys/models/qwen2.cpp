@@ -19,16 +19,6 @@ static inline tensor_t TO_CPP_TENSOR(llaisysTensor_t t) {
     return tensor_t(reinterpret_cast<Tensor*>(t), [](Tensor*){});
 }
 
-static void element_wise_add(tensor_t a, tensor_t b) {
-    if (!a || !b) return;
-    float* a_ptr = reinterpret_cast<float*>(a->data());
-    const float* b_ptr = reinterpret_cast<const float*>(b->data());
-    size_t size = a->numel();
-    for (size_t i = 0; i < size; ++i) {
-        a_ptr[i] += b_ptr[i];
-    }
-}
-
 // ==========================================
 // 2. 模型结构体定义
 // ==========================================
@@ -36,6 +26,8 @@ static void element_wise_add(tensor_t a, tensor_t b) {
 struct LlaisysQwen2Model {
     LlaisysQwen2Meta meta;
     LlaisysQwen2Weights weights;
+    llaisysDeviceType_t device_type;
+    int device_id;
     
     std::vector<tensor_t> resources;
     std::vector<std::vector<tensor_t>> kv_caches;
@@ -44,7 +36,6 @@ struct LlaisysQwen2Model {
     tensor_t input_ids_buf;
     tensor_t pos_ids_buf;
     
-    // 【修复】2D 缓冲区 [1, dim]
     tensor_t hidden_states; 
     tensor_t residual;      
     tensor_t norm_out;      
@@ -59,7 +50,39 @@ struct LlaisysQwen2Model {
 
     int64_t current_pos = 0;
 
-    LlaisysQwen2Model(const LlaisysQwen2Meta* m) : meta(*m) {
+    // 设备感知内存操作辅助函数
+    void memcpyH2D(tensor_t dst, const void* host_src, size_t bytes) {
+        if (device_type == LLAISYS_DEVICE_CPU) {
+            std::memcpy(dst->data(), host_src, bytes);
+        } else {
+            core::context().setDevice(device_type, device_id);
+            core::context().runtime().api()->memcpy_async(
+                dst->data(), host_src, bytes, LLAISYS_MEMCPY_H2D, nullptr);
+        }
+    }
+
+    void memcpyD2H(void* host_dst, tensor_t src, size_t bytes) {
+        if (device_type == LLAISYS_DEVICE_CPU) {
+            std::memcpy(host_dst, src->data(), bytes);
+        } else {
+            core::context().setDevice(device_type, device_id);
+            core::context().runtime().api()->memcpy_sync(
+                host_dst, src->data(), bytes, LLAISYS_MEMCPY_D2H);
+        }
+    }
+
+    void memcpyOnDevice(void* dst, const void* src, size_t bytes) {
+        if (device_type == LLAISYS_DEVICE_CPU) {
+            std::memcpy(dst, src, bytes);
+        } else {
+            core::context().setDevice(device_type, device_id);
+            core::context().runtime().api()->memcpy_async(
+                dst, src, bytes, LLAISYS_MEMCPY_D2D, nullptr);
+        }
+    }
+
+    LlaisysQwen2Model(const LlaisysQwen2Meta* m, llaisysDeviceType_t dev, int dev_id)
+        : meta(*m), device_type(dev), device_id(dev_id >= 0 ? dev_id : 0) {
         weights.in_embed = nullptr;
         weights.out_embed = nullptr;
         weights.out_norm_w = nullptr;
@@ -93,39 +116,36 @@ struct LlaisysQwen2Model {
     void init_cache() {
         std::vector<size_t> shape = {meta.maxseq, meta.nkvh, meta.dh};
         for (size_t i = 0; i < meta.nlayer; ++i) {
-            auto k_c = Tensor::create(shape, LLAISYS_DTYPE_F32);
-            auto v_c = Tensor::create(shape, LLAISYS_DTYPE_F32);
+            auto k_c = Tensor::create(shape, LLAISYS_DTYPE_F32, device_type, device_id);
+            auto v_c = Tensor::create(shape, LLAISYS_DTYPE_F32, device_type, device_id);
             kv_caches.push_back({k_c, v_c});
         }
     }
 
     void init_buffers() {
-        input_ids_buf = Tensor::create({1}, LLAISYS_DTYPE_I64);
-        pos_ids_buf = Tensor::create({1}, LLAISYS_DTYPE_I64);
+        input_ids_buf = Tensor::create({1}, LLAISYS_DTYPE_I64, device_type, device_id);
+        pos_ids_buf = Tensor::create({1}, LLAISYS_DTYPE_I64, device_type, device_id);
         
-        // 【核心修复】这里全部改为 2D {1, dim}，而不是 {1, 1, dim}
-        // 这样 Linear 算子读取 shape[1] 时才是正确的特征维度
-        hidden_states = Tensor::create({1, meta.hs}, LLAISYS_DTYPE_F32);
-        residual = Tensor::create({1, meta.hs}, LLAISYS_DTYPE_F32);
-        norm_out = Tensor::create({1, meta.hs}, LLAISYS_DTYPE_F32);
+        hidden_states = Tensor::create({1, meta.hs}, LLAISYS_DTYPE_F32, device_type, device_id);
+        residual = Tensor::create({1, meta.hs}, LLAISYS_DTYPE_F32, device_type, device_id);
+        norm_out = Tensor::create({1, meta.hs}, LLAISYS_DTYPE_F32, device_type, device_id);
 
         size_t q_dim = meta.nh * meta.dh;
         size_t kv_dim = meta.nkvh * meta.dh;
         
-        q = Tensor::create({1, q_dim}, LLAISYS_DTYPE_F32);
-        k = Tensor::create({1, kv_dim}, LLAISYS_DTYPE_F32);
-        v = Tensor::create({1, kv_dim}, LLAISYS_DTYPE_F32);
+        q = Tensor::create({1, q_dim}, LLAISYS_DTYPE_F32, device_type, device_id);
+        k = Tensor::create({1, kv_dim}, LLAISYS_DTYPE_F32, device_type, device_id);
+        v = Tensor::create({1, kv_dim}, LLAISYS_DTYPE_F32, device_type, device_id);
         
-        // attn_out 本来就是 Attention 的输出，必须是 3D，稍后 reshape
-        attn_out = Tensor::create({1, meta.nh, meta.dh}, LLAISYS_DTYPE_F32);
+        attn_out = Tensor::create({1, meta.nh, meta.dh}, LLAISYS_DTYPE_F32, device_type, device_id);
         
-        gate = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32);
-        up = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32);
-        mlp_act = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32);
+        gate = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32, device_type, device_id);
+        up = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32, device_type, device_id);
+        mlp_act = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32, device_type, device_id);
         
-        logits = Tensor::create({1, meta.voc}, LLAISYS_DTYPE_F32);
-        next_token = Tensor::create({1}, LLAISYS_DTYPE_I32);
-        max_val = Tensor::create({1}, LLAISYS_DTYPE_F32);
+        logits = Tensor::create({1, meta.voc}, LLAISYS_DTYPE_F32, device_type, device_id);
+        next_token = Tensor::create({1}, LLAISYS_DTYPE_I32, device_type, device_id);
+        max_val = Tensor::create({1}, LLAISYS_DTYPE_F32, device_type, device_id);
     }
 };
 
@@ -137,7 +157,8 @@ extern "C" {
 
 __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice) {
     if (!meta) return nullptr;
-    return new LlaisysQwen2Model(meta);
+    int dev_id = (device_ids && ndevice > 0) ? device_ids[0] : 0;
+    return new LlaisysQwen2Model(meta, device, dev_id);
 }
 
 __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model) {
@@ -160,27 +181,29 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
 
     for (size_t t = 0; t < ntoken; ++t) {
         int64_t token = token_ids[t];
+        int64_t pos = model->current_pos;
         
-        ((int64_t*)model->input_ids_buf->data())[0] = token;
-        ((int64_t*)model->pos_ids_buf->data())[0] = model->current_pos;
+        // H2D: 将 token 和 position 从 CPU 写入设备缓冲区
+        model->memcpyH2D(model->input_ids_buf, &token, sizeof(int64_t));
+        model->memcpyH2D(model->pos_ids_buf, &pos, sizeof(int64_t));
 
         // 1. Embedding
         ops::embedding(model->hidden_states, model->input_ids_buf, TO_CPP_TENSOR(model->weights.in_embed));
 
         // 2. Transformer Layers
         for (size_t i = 0; i < model->meta.nlayer; ++i) {
-            std::memcpy(model->residual->data(), model->hidden_states->data(), model->hidden_states->numel() * 4);
+            // Save residual via pointer swap (zero-cost)
+            std::swap(model->residual, model->hidden_states);
 
-            // A. Pre-Norm
-            ops::rms_norm(model->norm_out, model->hidden_states, TO_CPP_TENSOR(model->weights.attn_norm_w[i]), model->meta.epsilon);
+            // A. Pre-Norm (read from residual which now holds input)
+            ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.attn_norm_w[i]), model->meta.epsilon);
 
-            // B. QKV Linear (输入 2D, 输出 2D)
+            // B. QKV Linear
             ops::linear(model->q, model->norm_out, TO_CPP_TENSOR(model->weights.attn_q_w[i]), TO_CPP_TENSOR(model->weights.attn_q_b[i]));
             ops::linear(model->k, model->norm_out, TO_CPP_TENSOR(model->weights.attn_k_w[i]), TO_CPP_TENSOR(model->weights.attn_k_b[i]));
             ops::linear(model->v, model->norm_out, TO_CPP_TENSOR(model->weights.attn_v_w[i]), TO_CPP_TENSOR(model->weights.attn_v_b[i]));
 
             // C. RoPE
-            // 【关键】Reshape 2D -> 3D 以适配 RoPE 算子
             auto q_3d = model->q->reshape({1, model->meta.nh, model->meta.dh});
             auto k_3d = model->k->reshape({1, model->meta.nkvh, model->meta.dh});
             auto v_3d = model->v->reshape({1, model->meta.nkvh, model->meta.dh});
@@ -193,8 +216,8 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
                 size_t bytes = model->meta.nkvh * model->meta.dh * 4;
                 char* k_dst = (char*)model->kv_caches[i][0]->data() + model->current_pos * bytes;
                 char* v_dst = (char*)model->kv_caches[i][1]->data() + model->current_pos * bytes;
-                std::memcpy(k_dst, k_3d->data(), bytes);
-                std::memcpy(v_dst, v_3d->data(), bytes);
+                model->memcpyOnDevice(k_dst, k_3d->data(), bytes);
+                model->memcpyOnDevice(v_dst, v_3d->data(), bytes);
             }
 
             // E. Self Attention
@@ -202,20 +225,18 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             auto k_slice = model->kv_caches[i][0]->slice(0, 0, model->current_pos + 1);
             auto v_slice = model->kv_caches[i][1]->slice(0, 0, model->current_pos + 1);
             
-            // 计算 Attention，输出为 3D
             ops::self_attention(model->attn_out, q_3d, k_slice, v_slice, scale);
 
             // F. Output Projection
-            // 【关键】Reshape 3D -> 2D 以适配 Output Linear 算子
             auto attn_flat = model->attn_out->reshape({1, model->meta.hs});
             ops::linear(model->hidden_states, attn_flat, TO_CPP_TENSOR(model->weights.attn_o_w[i]), nullptr);
 
             // G. Residual Add 1
-            element_wise_add(model->hidden_states, model->residual);
+            ops::add(model->hidden_states, model->hidden_states, model->residual);
 
             // H. MLP Block
-            std::memcpy(model->residual->data(), model->hidden_states->data(), model->hidden_states->numel() * 4); 
-            ops::rms_norm(model->norm_out, model->hidden_states, TO_CPP_TENSOR(model->weights.mlp_norm_w[i]), model->meta.epsilon);
+            std::swap(model->residual, model->hidden_states);
+            ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.mlp_norm_w[i]), model->meta.epsilon);
 
             ops::linear(model->gate, model->norm_out, TO_CPP_TENSOR(model->weights.mlp_gate_w[i]), nullptr);
             ops::linear(model->up, model->norm_out, TO_CPP_TENSOR(model->weights.mlp_up_w[i]), nullptr);
@@ -225,7 +246,7 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             ops::linear(model->hidden_states, model->mlp_act, TO_CPP_TENSOR(model->weights.mlp_down_w[i]), nullptr);
 
             // I. Residual Add 2
-            element_wise_add(model->hidden_states, model->residual);
+            ops::add(model->hidden_states, model->hidden_states, model->residual);
         }
 
         // 4. Final Norm
@@ -238,7 +259,10 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
         auto logits_2d = model->logits->reshape({1, model->meta.voc});
         ops::argmax(model->next_token, model->max_val, logits_2d);
 
-        output_token = ((int*)model->next_token->data())[0];
+        // D2H: 从设备读取 argmax 结果
+        int32_t host_token;
+        model->memcpyD2H(&host_token, model->next_token, sizeof(int32_t));
+        output_token = host_token;
         
         model->current_pos++;
     }
@@ -255,10 +279,9 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
         numel *= shape[i];
     }
     
-    // 即使 Python 端传了 Float32 数据，我们也创建 F32 Tensor
-    auto tensor = llaisys::Tensor::create(shape_vec, (llaisysDataType_t)dtype);
-    size_t element_size = llaisys::utils::dsize((llaisysDataType_t)dtype);
-    std::memcpy(tensor->data(), data, numel * element_size);
+    // 在目标设备上创建 tensor，通过 load() 完成 H2D 传输
+    auto tensor = llaisys::Tensor::create(shape_vec, (llaisysDataType_t)dtype, model->device_type, model->device_id);
+    tensor->load(data);
 
     model->resources.push_back(tensor);
     llaisysTensor_t t_handle = reinterpret_cast<llaisysTensor_t>(tensor.get()); 

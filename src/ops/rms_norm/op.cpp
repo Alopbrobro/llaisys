@@ -1,5 +1,9 @@
 #include "op.hpp"
 
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/rms_norm_nvidia.cuh"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void rms_norm_cpu_kernel(tensor_t out, tensor_t in, tensor_t weight, float eps) {//Y:out    in:X    weight:W
@@ -47,6 +51,13 @@ void rms_norm_cpu_kernel(tensor_t out, tensor_t in, tensor_t weight, float eps) 
 }
 void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
     auto dtype = weight->dtype();
+
+#ifdef ENABLE_NVIDIA_API
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+        return nvidia::rms_norm(out, in, weight, eps);
+    }
+#endif
+
     if (dtype == llaisysDataType_t::LLAISYS_DTYPE_F32) {
         rms_norm_cpu_kernel<float>(out, in, weight, eps);
     } 

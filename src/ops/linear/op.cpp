@@ -1,5 +1,9 @@
 #include "op.hpp"
 
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/linear_nvidia.cuh"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void linear_cpu_kernel(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) { // Y = XW^T + offset
@@ -55,6 +59,13 @@ void linear_cpu_kernel(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias
 }
 void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     auto dtype = weight->dtype();
+
+#ifdef ENABLE_NVIDIA_API
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+        return nvidia::linear(out, in, weight, bias);
+    }
+#endif
+
     if (dtype == llaisysDataType_t::LLAISYS_DTYPE_F32) {
         linear_cpu_kernel<float>(out, in, weight, bias);
     } 

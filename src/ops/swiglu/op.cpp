@@ -1,5 +1,9 @@
 #include "op.hpp"
 
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/swiglu_nvidia.cuh"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void swiglu_cpu_kernel(tensor_t out, tensor_t gate, tensor_t up) {
@@ -34,6 +38,13 @@ void swiglu_cpu_kernel(tensor_t out, tensor_t gate, tensor_t up) {
 
 void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
     auto dtype = gate->dtype();
+
+#ifdef ENABLE_NVIDIA_API
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+        return nvidia::swiglu(out, gate, up);
+    }
+#endif
+
     if (dtype == LLAISYS_DTYPE_F32) {
         swiglu_cpu_kernel<float>(out, gate, up);
     } 

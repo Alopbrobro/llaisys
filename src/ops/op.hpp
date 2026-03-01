@@ -4,6 +4,9 @@
 namespace llaisys {
 namespace ops {
 
+// 0. Element-wise Add (C = A + B)
+void add(tensor_t c, tensor_t a, tensor_t b);
+
 // 1. Argmax
 void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals);
 

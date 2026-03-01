@@ -113,6 +113,7 @@ if __name__ == "__main__":
 
     del model
     gc.collect()
+    torch.cuda.empty_cache()
 
     print("\n=== Answer ===\n")
     print("Tokens:")

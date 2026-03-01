@@ -1,0 +1,49 @@
+# Python 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# xmake 编译产物
+.xmake/
+build/
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# 文档和资源
+*.md
+LICENSE
+docs/
+
+# 测试文件
+test/
+tests/
+
+# 临时文件
+*.log
+*.tmp
+.DS_Store
+
+# 不需要的 Python 构建目录
+python/build/
+python/dist/
+python/*.egg-info/
+
+# 已编译的库文件（会在容器内重新编译）
+lib/*.so
+bin/*.dll
+python/llaisys/libllaisys/*.so
+python/llaisys/libllaisys/*.dll
