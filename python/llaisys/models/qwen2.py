@@ -10,7 +10,9 @@ from ..libllaisys.qwen2 import (
     model_create, 
     model_destroy, 
     load_weight, 
-    model_infer
+    model_infer,
+    model_infer_sample,
+    model_reset_cache
 )
 
 from pathlib import Path
@@ -36,6 +38,17 @@ model_infer.argtypes = [
     ctypes.c_size_t                 # ntoken (size_t)
 ]
 model_infer.restype = ctypes.c_int64
+
+# InferSample 的签名
+model_infer_sample.argtypes = [
+    ctypes.c_void_p,                # model
+    ctypes.POINTER(ctypes.c_int64), # token_ids (int64_t*)
+    ctypes.c_size_t,                # ntoken (size_t)
+    ctypes.c_float,                 # temperature
+    ctypes.c_int,                   # top_k
+    ctypes.c_float,                 # top_p
+]
+model_infer_sample.restype = ctypes.c_int64
 # =========================================================================
 
 class Qwen2:
@@ -108,39 +121,39 @@ class Qwen2:
         if not inputs:
             return []
 
-        # test/test_infer.py expects the returned token list to include the prompt
-        # (HF model.generate returns [prompt + generated]).
         output_ids = list(inputs)
         max_tokens = max_new_tokens if max_new_tokens is not None else 20
         
+        use_sampling = (top_k != 1) and (temperature > 0.0)
+        
         # --- 1. Prefill ---
         input_len = len(inputs)
-        
-        # 【终极修复】使用 Numpy 数组来传递数据
-        # 1. 创建 numpy int64 数组，这是内存中最标准的 C int64_t 数组形式
         input_np = np.array(inputs, dtype=np.int64)
-        
-        # 2. 确保内存连续 (Contiguous)，否则 C++ 指针移动会出错
         if not input_np.flags['C_CONTIGUOUS']:
             input_np = np.ascontiguousarray(input_np)
-            
-        # 3. 获取底层数据指针 (void*) 并转为 int64_t*
-        # 这一步绕过了 ctypes 所有的自动转换猜测，直接传内存地址
         input_ptr = input_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
         
-        # 调用推理
-        next_token = model_infer(self.model_handle, input_ptr, ctypes.c_size_t(input_len))
+        if use_sampling:
+            next_token = model_infer_sample(
+                self.model_handle, input_ptr, ctypes.c_size_t(input_len),
+                ctypes.c_float(temperature), ctypes.c_int(top_k), ctypes.c_float(top_p))
+        else:
+            next_token = model_infer(self.model_handle, input_ptr, ctypes.c_size_t(input_len))
 
         output_ids.append(int(next_token))
         current_token = next_token
         
         # --- 2. Decoding ---
         for _ in range(max_tokens - 1):
-            # 同样对单个 token 使用 numpy 处理
             token_np = np.array([current_token], dtype=np.int64)
             token_ptr = token_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
             
-            next_token = model_infer(self.model_handle, token_ptr, ctypes.c_size_t(1))
+            if use_sampling:
+                next_token = model_infer_sample(
+                    self.model_handle, token_ptr, ctypes.c_size_t(1),
+                    ctypes.c_float(temperature), ctypes.c_int(top_k), ctypes.c_float(top_p))
+            else:
+                next_token = model_infer(self.model_handle, token_ptr, ctypes.c_size_t(1))
 
             output_ids.append(int(next_token))
             current_token = next_token
@@ -150,6 +163,61 @@ class Qwen2:
 
         return output_ids
 
+    def generate_stream(
+        self,
+        inputs: Sequence[int],
+        max_new_tokens: Optional[int] = None,
+        top_k: int = 50,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+    ):
+        """Generator that yields one token at a time."""
+        if not inputs:
+            return
+
+        max_tokens = max_new_tokens if max_new_tokens is not None else 512
+        use_sampling = (top_k != 1) and (temperature > 0.0)
+        
+        # Prefill
+        input_len = len(inputs)
+        input_np = np.array(inputs, dtype=np.int64)
+        if not input_np.flags['C_CONTIGUOUS']:
+            input_np = np.ascontiguousarray(input_np)
+        input_ptr = input_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+        
+        if use_sampling:
+            next_token = model_infer_sample(
+                self.model_handle, input_ptr, ctypes.c_size_t(input_len),
+                ctypes.c_float(temperature), ctypes.c_int(top_k), ctypes.c_float(top_p))
+        else:
+            next_token = model_infer(self.model_handle, input_ptr, ctypes.c_size_t(input_len))
+
+        next_token = int(next_token)
+        yield next_token
+        current_token = next_token
+        
+        # Decode
+        for _ in range(max_tokens - 1):
+            if current_token == 151643:  # EOS
+                break
+            token_np = np.array([current_token], dtype=np.int64)
+            token_ptr = token_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+            
+            if use_sampling:
+                next_token = model_infer_sample(
+                    self.model_handle, token_ptr, ctypes.c_size_t(1),
+                    ctypes.c_float(temperature), ctypes.c_int(top_k), ctypes.c_float(top_p))
+            else:
+                next_token = model_infer(self.model_handle, token_ptr, ctypes.c_size_t(1))
+
+            next_token = int(next_token)
+            yield next_token
+            current_token = next_token
+
     def __del__(self):
         if hasattr(self, 'model_handle') and self.model_handle:
             model_destroy(self.model_handle)
+
+    def reset_cache(self):
+        """Reset the KV-cache position without reloading weights."""
+        model_reset_cache(self.model_handle)

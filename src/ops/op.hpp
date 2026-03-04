@@ -28,5 +28,9 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
 // 7. SwiGLU (Element-wise)
 void swiglu(tensor_t out, tensor_t gate, tensor_t up);
 
+// 8. Sample (Temperature + Top-K + Top-P)
+void sample(tensor_t out_idx, tensor_t logits,
+            float temperature, int top_k, float top_p, uint64_t seed);
+
 } // namespace ops
 } // namespace llaisys
