@@ -58,6 +58,23 @@ def _setup_functions():
         ]
         lib.llaisysQwen2ModelInfer.restype = ctypes.c_int64
 
+    # InferSample
+    if hasattr(lib, 'llaisysQwen2ModelInferSample'):
+        lib.llaisysQwen2ModelInferSample.argtypes = [
+            ctypes.c_void_p,                # model
+            ctypes.POINTER(ctypes.c_int64), # token_ids
+            ctypes.c_size_t,                # ntoken
+            ctypes.c_float,                 # temperature
+            ctypes.c_int,                   # top_k
+            ctypes.c_float,                 # top_p
+        ]
+        lib.llaisysQwen2ModelInferSample.restype = ctypes.c_int64
+
+    # ResetCache
+    if hasattr(lib, 'llaisysQwen2ResetCache'):
+        lib.llaisysQwen2ResetCache.argtypes = [ctypes.c_void_p]
+        lib.llaisysQwen2ResetCache.restype = None
+
 # 执行配置
 _setup_functions()
 
@@ -66,3 +83,5 @@ model_create = LIB_LLAISYS.llaisysQwen2ModelCreate
 model_destroy = LIB_LLAISYS.llaisysQwen2ModelDestroy
 load_weight = LIB_LLAISYS.llaisysQwen2LoadWeightByName
 model_infer = LIB_LLAISYS.llaisysQwen2ModelInfer
+model_infer_sample = LIB_LLAISYS.llaisysQwen2ModelInferSample
+model_reset_cache = LIB_LLAISYS.llaisysQwen2ResetCache

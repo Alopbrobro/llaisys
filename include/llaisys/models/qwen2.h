@@ -48,5 +48,12 @@ __C {
 
     // 执行推理
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
+
+    // 执行推理 (带采样参数)
+    __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken,
+                                                  float temperature, int top_k, float top_p);
+
+    // 重置 KV-Cache 位置 (不重新加载权重)
+    __export void llaisysQwen2ResetCache(struct LlaisysQwen2Model * model);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

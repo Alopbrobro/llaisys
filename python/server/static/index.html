@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLAISYS Chat</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ── Header ── */
+.header {
+    background: #16213e;
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+}
+.header h1 { font-size: 18px; color: #e94560; }
+.header-actions { display: flex; gap: 8px; }
+.btn {
+    padding: 6px 14px;
+    border: 1px solid #0f3460;
+    background: #16213e;
+    color: #e0e0e0;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.2s;
+}
+.btn:hover { background: #0f3460; }
+.btn-danger { border-color: #e94560; color: #e94560; }
+.btn-danger:hover { background: #e94560; color: #fff; }
+
+/* ── Chat Area ── */
+.chat-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.message {
+    max-width: 80%;
+    padding: 12px 16px;
+    border-radius: 12px;
+    line-height: 1.6;
+    font-size: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.message.user {
+    align-self: flex-end;
+    background: #0f3460;
+    border-bottom-right-radius: 4px;
+}
+.message.assistant {
+    align-self: flex-start;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-bottom-left-radius: 4px;
+}
+.message .role-tag {
+    font-size: 11px;
+    color: #888;
+    margin-bottom: 4px;
+}
+.message.user .role-tag { color: #5dade2; }
+.message.assistant .role-tag { color: #e94560; }
+
+.typing-indicator {
+    display: inline-block;
+    width: 8px; height: 8px;
+    background: #e94560;
+    border-radius: 50%;
+    animation: blink 1s infinite;
+    margin-left: 4px;
+}
+@keyframes blink { 0%,100%{opacity:.2} 50%{opacity:1} }
+
+/* ── Input Area ── */
+.input-area {
+    padding: 12px 20px;
+    background: #16213e;
+    border-top: 1px solid #0f3460;
+    display: flex;
+    gap: 10px;
+    flex-shrink: 0;
+}
+#msg-input {
+    flex: 1;
+    padding: 10px 14px;
+    border: 1px solid #0f3460;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    border-radius: 8px;
+    font-size: 14px;
+    outline: none;
+    resize: none;
+    min-height: 42px;
+    max-height: 120px;
+    font-family: inherit;
+}
+#msg-input:focus { border-color: #e94560; }
+#send-btn {
+    padding: 10px 20px;
+    background: #e94560;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    transition: background 0.2s;
+    align-self: flex-end;
+}
+#send-btn:hover { background: #c0392b; }
+#send-btn:disabled { background: #555; cursor: not-allowed; }
+
+/* ── Settings Panel ── */
+.settings-panel {
+    display: none;
+    position: absolute;
+    top: 50px;
+    right: 20px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    padding: 16px;
+    z-index: 10;
+    min-width: 240px;
+}
+.settings-panel.open { display: block; }
+.settings-panel label {
+    display: block;
+    font-size: 12px;
+    color: #888;
+    margin-top: 10px;
+}
+.settings-panel input {
+    width: 100%;
+    padding: 6px 8px;
+    background: #1a1a2e;
+    border: 1px solid #0f3460;
+    color: #e0e0e0;
+    border-radius: 4px;
+    margin-top: 4px;
+    font-size: 13px;
+}
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>LLAISYS Chat</h1>
+    <div class="header-actions">
+        <button class="btn" onclick="toggleSettings()">Settings</button>
+        <button class="btn btn-danger" onclick="newChat()">New Chat</button>
+    </div>
+</div>
+
+<div class="settings-panel" id="settings-panel">
+    <label>Temperature
+        <input type="number" id="cfg-temp" value="0.8" step="0.1" min="0" max="2">
+    </label>
+    <label>Top-K
+        <input type="number" id="cfg-topk" value="50" min="1" max="200">
+    </label>
+    <label>Top-P
+        <input type="number" id="cfg-topp" value="0.9" step="0.05" min="0" max="1">
+    </label>
+    <label>Max Tokens
+        <input type="number" id="cfg-max" value="512" min="1" max="4096">
+    </label>
+</div>
+
+<div class="chat-container" id="chat-container"></div>
+
+<div class="input-area">
+    <textarea id="msg-input" rows="1" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"></textarea>
+    <button id="send-btn" onclick="sendMessage()">发送</button>
+</div>
+
+<script>
+const API_URL = window.location.origin + "/v1/chat/completions";
+let history = [];
+let isGenerating = false;
+
+const chatContainer = document.getElementById("chat-container");
+const msgInput = document.getElementById("msg-input");
+const sendBtn = document.getElementById("send-btn");
+
+// ── Auto-resize textarea ──
+msgInput.addEventListener("input", () => {
+    msgInput.style.height = "auto";
+    msgInput.style.height = Math.min(msgInput.scrollHeight, 120) + "px";
+});
+
+// ── Enter to send ──
+msgInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+
+function toggleSettings() {
+    document.getElementById("settings-panel").classList.toggle("open");
+}
+
+function newChat() {
+    history = [];
+    chatContainer.innerHTML = "";
+    msgInput.focus();
+}
+
+function addMessage(role, content) {
+    const div = document.createElement("div");
+    div.className = `message ${role}`;
+    const tag = document.createElement("div");
+    tag.className = "role-tag";
+    tag.textContent = role === "user" ? "You" : "LLAISYS";
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    body.textContent = content;
+    div.appendChild(tag);
+    div.appendChild(body);
+    chatContainer.appendChild(div);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+    return body;
+}
+
+async function sendMessage() {
+    const text = msgInput.value.trim();
+    if (!text || isGenerating) return;
+
+    isGenerating = true;
+    sendBtn.disabled = true;
+    msgInput.value = "";
+    msgInput.style.height = "auto";
+
+    // Add user message
+    history.push({ role: "user", content: text });
+    addMessage("user", text);
+
+    // Create assistant bubble
+    const botBody = addMessage("assistant", "");
+    botBody.innerHTML = '<span class="typing-indicator"></span>';
+
+    const temperature = parseFloat(document.getElementById("cfg-temp").value) || 0.8;
+    const top_k = parseInt(document.getElementById("cfg-topk").value) || 50;
+    const top_p = parseFloat(document.getElementById("cfg-topp").value) || 0.9;
+    const max_tokens = parseInt(document.getElementById("cfg-max").value) || 512;
+
+    try {
+        const resp = await fetch(API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                messages: history,
+                temperature, top_k, top_p, max_tokens,
+                stream: true,
+            }),
+        });
+
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let assistantText = "";
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop(); // keep incomplete line
+
+            for (const line of lines) {
+                if (!line.startsWith("data: ")) continue;
+                const data = line.slice(6);
+                if (data === "[DONE]") continue;
+
+                try {
+                    const chunk = JSON.parse(data);
+                    const content = chunk.choices?.[0]?.delta?.content;
+                    if (content) {
+                        assistantText += content;
+                        botBody.textContent = assistantText;
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    }
+                } catch (e) { /* skip bad chunk */ }
+            }
+        }
+
+        history.push({ role: "assistant", content: assistantText });
+        if (!assistantText) botBody.textContent = "(空回复)";
+
+    } catch (err) {
+        botBody.textContent = `[错误] ${err.message}`;
+        botBody.style.color = "#e94560";
+        history.pop(); // remove failed user message
+    }
+
+    isGenerating = false;
+    sendBtn.disabled = false;
+    msgInput.focus();
+}
+</script>
+</body>
+</html>
