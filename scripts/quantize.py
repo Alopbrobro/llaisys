@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""INT8 Weight-Only 对称量化工具
+"""Weight-Only 对称量化工具 (INT8 / INT4)
 
 用法:
+    # INT8 per-channel 量化 (~2x 压缩)
     python scripts/quantize.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --output ./quantized_model
 
+    # INT4 per-group 量化 (~4x 压缩)
+    python scripts/quantize.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --output ./quantized_model_int4 --bits 4 --group-size 128
+
 原理:
-    对每个 Linear 权重矩阵 W (shape [out, in]):
-    1. 按 per-channel (每一行) 计算 scale = max(|W_row|) / 127
-    2. 量化: W_int8 = round(W / scale).clamp(-128, 127)
-    3. 保存: W_int8 (int8) + scale (float32, shape [out])
-    
-    推理时 dequantize: W_fp32 ≈ W_int8 * scale (per-channel broadcast)
+    INT8 per-channel:
+        scale = max(|W_row|) / 127
+        W_int8 = round(W / scale).clamp(-128, 127)
+        保存: W_int8 (int8, [out, in]) + scale (float32, [out])
+
+    INT4 per-group:
+        对每组 group_size 个连续元素:
+        scale = max(|group|) / 7
+        W_int4 = round(W / scale).clamp(-8, 7)
+        打包: 两个 INT4 值存入一个 uint8 字节
+        byte = ((val1 + 8) << 4) | ((val0 + 8) & 0x0F)
+        保存: W_packed (uint8, [out, in/2]) + scale (float32, [out, in/group_size])
 """
 
 import argparse
@@ -80,11 +90,62 @@ def quantize_per_channel_symmetric(weight: torch.Tensor):
     return w_int8, scale.float()
 
 
-def quantize_model(model_path: str, output_dir: str):
-    """读取 safetensors 模型并量化"""
+def quantize_per_group_symmetric_int4(weight: torch.Tensor, group_size: int = 128):
+    """Per-group 对称 INT4 量化, 两个 INT4 值打包进一个 uint8
+
+    Args:
+        weight: FP32 / FP16 tensor, shape [out_features, in_features]
+        group_size: 每组元素个数 (必须能整除 in_features, 且为偶数)
+
+    Returns:
+        packed: uint8 tensor, shape [out_features, in_features // 2]
+        scale:  FP32 tensor, shape [out_features, num_groups]
+    """
+    w = weight.float()                     # [rows, cols]
+    rows, cols = w.shape
+
+    assert cols % group_size == 0, f"in_features {cols} 不能被 group_size {group_size} 整除"
+    assert group_size % 2 == 0, f"group_size {group_size} 必须为偶数"
+    num_groups = cols // group_size
+
+    # Reshape 为 [rows, num_groups, group_size]
+    w_grouped = w.reshape(rows, num_groups, group_size)
+
+    # Per-group: 每组最大绝对值
+    group_max = w_grouped.abs().amax(dim=-1)    # [rows, num_groups]
+
+    # scale = max(|group|) / 7, 防止除零
+    scale = group_max / 7.0
+    scale = scale.clamp(min=1e-10)              # [rows, num_groups]
+
+    # 量化到 [-8, 7]
+    w_scaled = w_grouped / scale.unsqueeze(-1)  # [rows, num_groups, group_size]
+    w_int4 = w_scaled.round().clamp(-8, 7).to(torch.int8)  # 用 int8 暂存
+
+    # 展平回 [rows, cols]
+    w_int4 = w_int4.reshape(rows, cols)
+
+    # 打包: 两个 INT4 值存入一个 uint8
+    # byte = ((val[2k+1] + 8) << 4) | ((val[2k] + 8) & 0x0F)
+    # 偶数列 → 低 nibble, 奇数列 → 高 nibble
+    w_even = (w_int4[:, 0::2] + 8).to(torch.uint8)  # [rows, cols/2], 范围 [0, 15]
+    w_odd  = (w_int4[:, 1::2] + 8).to(torch.uint8)  # [rows, cols/2], 范围 [0, 15]
+    packed = (w_odd << 4) | (w_even & 0x0F)          # [rows, cols/2], uint8
+
+    return packed, scale.float()
+
+
+def quantize_model(model_path: str, output_dir: str, bits: int = 8, group_size: int = 128):
+    """读取 safetensors 模型并量化 (INT8 per-channel 或 INT4 per-group)"""
     model_path = Path(model_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    assert bits in (4, 8), f"bits 必须为 4 或 8, 当前: {bits}"
+    if bits == 4:
+        print(f"==> INT4 per-group 量化, group_size={group_size}")
+    else:
+        print(f"==> INT8 per-channel 量化")
     
     # 如果是 HuggingFace model ID, 先下载
     if not model_path.exists():
@@ -98,7 +159,7 @@ def quantize_model(model_path: str, output_dir: str):
         sys.exit(1)
     
     quantized_tensors = {}
-    stats = {"quantized": 0, "skipped": 0, "total_params_fp32": 0, "total_params_int8": 0}
+    stats = {"quantized": 0, "skipped": 0, "total_bytes_fp32": 0, "total_bytes_quant": 0}
     
     for file in st_files:
         print(f"\nProcessing: {file.name}")
@@ -107,22 +168,30 @@ def quantize_model(model_path: str, output_dir: str):
                 tensor = f.get_tensor(name)
                 
                 if should_quantize(name):
-                    # 量化
-                    w_int8, scale = quantize_per_channel_symmetric(tensor)
-                    quantized_tensors[name] = w_int8
-                    quantized_tensors[name + ".scale"] = scale
-                    
-                    # 统计
                     orig_bytes = tensor.numel() * tensor.element_size()
-                    quant_bytes = w_int8.numel() * 1 + scale.numel() * 4
-                    ratio = orig_bytes / quant_bytes
+
+                    if bits == 4:
+                        # INT4 per-group
+                        packed, scale = quantize_per_group_symmetric_int4(tensor, group_size)
+                        quantized_tensors[name] = packed      # uint8, [rows, cols/2]
+                        quantized_tensors[name + ".scale"] = scale  # float32, [rows, num_groups]
+                        quant_bytes = packed.numel() * 1 + scale.numel() * 4
+                        label = "int4"
+                    else:
+                        # INT8 per-channel
+                        w_int8, scale = quantize_per_channel_symmetric(tensor)
+                        quantized_tensors[name] = w_int8      # int8, [rows, cols]
+                        quantized_tensors[name + ".scale"] = scale  # float32, [rows]
+                        quant_bytes = w_int8.numel() * 1 + scale.numel() * 4
+                        label = "int8"
                     
+                    ratio = orig_bytes / quant_bytes
                     stats["quantized"] += 1
-                    stats["total_params_fp32"] += tensor.numel() * tensor.element_size()
-                    stats["total_params_int8"] += quant_bytes
+                    stats["total_bytes_fp32"] += orig_bytes
+                    stats["total_bytes_quant"] += quant_bytes
                     
                     print(f"  [QUANT] {name}: {list(tensor.shape)} "
-                          f"{tensor.dtype} → int8, "
+                          f"{tensor.dtype} → {label}, "
                           f"compress {ratio:.1f}x")
                 else:
                     # 不量化, 保持 FP32
@@ -133,7 +202,8 @@ def quantize_model(model_path: str, output_dir: str):
                     print(f"  [KEEP]  {name}: {list(tensor.shape)} → float32")
     
     # 保存量化后的模型
-    output_file = output_dir / "model_int8.safetensors"
+    suffix = "int4" if bits == 4 else "int8"
+    output_file = output_dir / f"model_{suffix}.safetensors"
     print(f"\nSaving quantized model to {output_file} ...")
     safetensors.torch.save_file(quantized_tensors, str(output_file))
     
@@ -147,10 +217,15 @@ def quantize_model(model_path: str, output_dir: str):
             print(f"Copied {fname}")
     
     # 保存量化元信息
+    if bits == 4:
+        quant_method = f"per_group_symmetric_int4_g{group_size}"
+    else:
+        quant_method = "per_channel_symmetric_int8"
+
     quant_config = {
-        "quant_method": "per_channel_symmetric_int8",
-        "bits": 8,
-        "group_size": -1,  # per-channel, 不是 group
+        "quant_method": quant_method,
+        "bits": bits,
+        "group_size": group_size if bits == 4 else -1,
         "quantized_suffixes": QUANTIZE_SUFFIXES,
         "stats": stats,
     }
@@ -158,25 +233,30 @@ def quantize_model(model_path: str, output_dir: str):
         json.dump(quant_config, f, indent=2)
     
     # 打印统计
-    if stats["total_params_fp32"] > 0:
-        overall_ratio = stats["total_params_fp32"] / stats["total_params_int8"]
+    if stats["total_bytes_fp32"] > 0:
+        overall_ratio = stats["total_bytes_fp32"] / stats["total_bytes_quant"]
     else:
         overall_ratio = 1.0
     
     print(f"\n{'='*50}")
     print(f"Quantization complete!")
+    print(f"  Method:            INT{bits} {'per-group (g=' + str(group_size) + ')' if bits == 4 else 'per-channel'}")
     print(f"  Quantized tensors: {stats['quantized']}")
     print(f"  Skipped tensors:   {stats['skipped']}")
-    print(f"  Original size:     {stats['total_params_fp32'] / 1e6:.1f} MB (weight only)")
-    print(f"  Quantized size:    {stats['total_params_int8'] / 1e6:.1f} MB (weight only)")
+    print(f"  Original size:     {stats['total_bytes_fp32'] / 1e6:.1f} MB (weight only)")
+    print(f"  Quantized size:    {stats['total_bytes_quant'] / 1e6:.1f} MB (weight only)")
     print(f"  Compression ratio: {overall_ratio:.2f}x")
     print(f"  Output: {output_dir}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="INT8 Weight-Only Quantization")
+    parser = argparse.ArgumentParser(description="Weight-Only Quantization (INT8/INT4)")
     parser.add_argument("--model", required=True, help="HuggingFace model ID or local path")
     parser.add_argument("--output", required=True, help="Output directory for quantized model")
+    parser.add_argument("--bits", type=int, default=8, choices=[4, 8],
+                        help="Quantization bits (4 or 8, default: 8)")
+    parser.add_argument("--group-size", type=int, default=128,
+                        help="Group size for INT4 quantization (default: 128)")
     args = parser.parse_args()
     
-    quantize_model(args.model, args.output)
+    quantize_model(args.model, args.output, bits=args.bits, group_size=args.group_size)

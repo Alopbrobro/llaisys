@@ -35,5 +35,8 @@ void sample(tensor_t out_idx, tensor_t logits,
 // 9. Dequantize (INT8 → FP32, per-channel symmetric)
 void dequantize(tensor_t out, tensor_t weight, tensor_t scale);
 
+// 10. Dequantize INT4 (packed uint8 → FP32, per-group symmetric)
+void dequantize_int4(tensor_t out, tensor_t weight, tensor_t scale, int group_size);
+
 } // namespace ops
 } // namespace llaisys

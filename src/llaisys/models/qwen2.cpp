@@ -218,7 +218,7 @@ struct LlaisysQwen2Model {
         return buf;
     }
 
-    // 量化感知的 linear 调用: 如果 weight 是 INT8 则先 dequantize
+    // 量化感知的 linear 调用: 如果 weight 是 INT8/INT4 则先 dequantize
     void linear_maybe_dequant(tensor_t out, tensor_t in,
                               llaisysTensor_t w_handle, llaisysTensor_t scale_handle,
                               llaisysTensor_t bias_handle) {
@@ -232,6 +232,17 @@ struct LlaisysQwen2Model {
             size_t cols = w->shape()[1];
             auto dq_buf = get_dequant_buf(rows, cols);
             ops::dequantize(dq_buf, w, sc);
+            ops::linear(out, in, dq_buf, b);
+        } else if (w->dtype() == LLAISYS_DTYPE_U8 && scale_handle) {
+            // INT4 packed 路径: dequantize_int4 → FP32 → linear
+            auto sc = TO_CPP_TENSOR(scale_handle);
+            size_t rows = w->shape()[0];
+            size_t packed_cols = w->shape()[1];
+            size_t cols = packed_cols * 2;       // 原始列数
+            size_t num_groups = sc->shape()[1];  // scale 是 2D: [rows, num_groups]
+            int group_size = (int)(cols / num_groups);
+            auto dq_buf = get_dequant_buf(rows, cols);
+            ops::dequantize_int4(dq_buf, w, sc, group_size);
             ops::linear(out, in, dq_buf, b);
         } else {
             // FP32 / FP16 原始路径
@@ -470,8 +481,8 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
     model->resources.push_back(tensor);
     llaisysTensor_t t_handle = reinterpret_cast<llaisysTensor_t>(tensor.get()); 
 
-    // 如果加载了 INT8 类型的权重，标记模型为量化模式
-    if ((llaisysDataType_t)dtype == LLAISYS_DTYPE_I8) {
+    // 如果加载了 INT8 或 U8 (INT4 packed) 类型的权重，标记模型为量化模式
+    if ((llaisysDataType_t)dtype == LLAISYS_DTYPE_I8 || (llaisysDataType_t)dtype == LLAISYS_DTYPE_U8) {
         model->has_quantized = true;
     }
     

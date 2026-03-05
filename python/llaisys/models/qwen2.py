@@ -104,10 +104,12 @@ class Qwen2:
         # 检测是否是量化模型 (有 quant_config.json)
         quant_config_path = model_path / "quant_config.json"
         is_quantized = quant_config_path.exists()
+        quant_bits = 0
         if is_quantized:
             with open(quant_config_path) as f:
                 qcfg = json.load(f)
-            print(f"Detected quantized model: {qcfg.get('quant_method', 'unknown')}")
+            quant_bits = qcfg.get("bits", 8)
+            print(f"Detected quantized model: {qcfg.get('quant_method', 'unknown')} (bits={quant_bits})")
         
         files = sorted(list(model_path.glob("*.safetensors")))
         if not files:
@@ -128,8 +130,11 @@ class Qwen2:
                     if tensor.dtype == torch.int8:
                         # INT8 量化权重 — 原样传递
                         dtype_enum = 3  # LLAISYS_DTYPE_I8
+                    elif tensor.dtype == torch.uint8:
+                        # INT4 packed 量化权重 — 原样传递  (U8)
+                        dtype_enum = 7  # LLAISYS_DTYPE_U8
                     elif name_.endswith(".scale"):
-                        # scale 向量 — 确保 FP32
+                        # scale 向量/矩阵 — 确保 FP32
                         if tensor.dtype != torch.float32:
                             tensor = tensor.to(torch.float32)
                         dtype_enum = 13  # LLAISYS_DTYPE_F32

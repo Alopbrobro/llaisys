@@ -89,3 +89,4 @@ Thumbs.db
 ehthumbs.db
 desktop.ini
 quantized_model/
+quantized_model_int4/
