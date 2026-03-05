@@ -88,3 +88,4 @@ htmlcov/
 Thumbs.db
 ehthumbs.db
 desktop.ini
+quantized_model/

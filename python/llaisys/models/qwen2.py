@@ -95,9 +95,20 @@ class Qwen2:
         if "bfloat16" in dtype_str: return 19
         if "int64" in dtype_str: return 6
         if "int32" in dtype_str: return 5
+        if "int8" in dtype_str: return 3
         return 0
 
     def _load_weights(self, model_path):
+        import json
+        
+        # 检测是否是量化模型 (有 quant_config.json)
+        quant_config_path = model_path / "quant_config.json"
+        is_quantized = quant_config_path.exists()
+        if is_quantized:
+            with open(quant_config_path) as f:
+                qcfg = json.load(f)
+            print(f"Detected quantized model: {qcfg.get('quant_method', 'unknown')}")
+        
         files = sorted(list(model_path.glob("*.safetensors")))
         if not files:
             print(f"Warning: No .safetensors files found in {model_path}")
@@ -106,21 +117,33 @@ class Qwen2:
             with safetensors.safe_open(file, framework="pt", device="cpu") as data_:
                 for name_ in data_.keys():
                     tensor = data_.get_tensor(name_)
-                    # 1. 强制转为 Float32 以匹配 C++ 计算类型
-                    if tensor.dtype != torch.float32:
-                        tensor = tensor.to(torch.float32)
                     
                     c_name = name_.encode('utf-8')
-                    # 2. 确保内存连续
+                    
+                    # 确保内存连续
                     if not tensor.is_contiguous():
                         tensor = tensor.contiguous()
+                    
+                    # 根据 tensor dtype 决定如何传给 C++
+                    if tensor.dtype == torch.int8:
+                        # INT8 量化权重 — 原样传递
+                        dtype_enum = 3  # LLAISYS_DTYPE_I8
+                    elif name_.endswith(".scale"):
+                        # scale 向量 — 确保 FP32
+                        if tensor.dtype != torch.float32:
+                            tensor = tensor.to(torch.float32)
+                        dtype_enum = 13  # LLAISYS_DTYPE_F32
+                    else:
+                        # 普通权重 — 转 FP32
+                        if tensor.dtype != torch.float32:
+                            tensor = tensor.to(torch.float32)
+                        dtype_enum = 13  # LLAISYS_DTYPE_F32
                         
                     data_ptr = tensor.data_ptr()
                     ndim = len(tensor.shape)
                     shape_array = (ctypes.c_int64 * ndim)(*tensor.shape)
-                    dtype = 13 # F32
                     
-                    load_weight(self.model_handle, c_name, ctypes.c_void_p(data_ptr), ndim, shape_array, dtype)
+                    load_weight(self.model_handle, c_name, ctypes.c_void_p(data_ptr), ndim, shape_array, dtype_enum)
 
     def generate(
         self,

@@ -1,5 +1,6 @@
 #include "llaisys/models/qwen2.h"
-#include "../../ops/op.hpp"        
+#include "../../ops/op.hpp"
+#include "../../ops/dequantize/op.hpp"
 #include "../../utils/types.hpp"   
 #include <vector>
 #include <iostream>
@@ -67,6 +68,13 @@ struct LlaisysQwen2Model {
     
     std::vector<tensor_t> resources;
     std::vector<std::vector<tensor_t>> kv_caches;
+
+    // INT8 量化标记
+    bool has_quantized = false;
+
+    // Dequantize 临时缓冲区 (按需分配)
+    // key = (rows << 32) | cols, value = FP32 buffer
+    std::unordered_map<uint64_t, tensor_t> dequant_cache;
 
     // 缓冲区声明
     tensor_t input_ids_buf;
@@ -137,6 +145,16 @@ struct LlaisysQwen2Model {
         weights.mlp_up_w = new llaisysTensor_t[meta.nlayer]();
         weights.mlp_down_w = new llaisysTensor_t[meta.nlayer]();
 
+        // INT8 量化 scale 数组
+        weights.out_embed_scale = nullptr;
+        weights.attn_q_w_scale = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_k_w_scale = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_v_w_scale = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_o_w_scale = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_gate_w_scale = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_up_w_scale = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_down_w_scale = new llaisysTensor_t[meta.nlayer]();
+
         init_cache();
         init_buffers();
     }
@@ -148,6 +166,11 @@ struct LlaisysQwen2Model {
         delete[] weights.attn_o_w;
         delete[] weights.mlp_norm_w;  delete[] weights.mlp_gate_w;
         delete[] weights.mlp_up_w;    delete[] weights.mlp_down_w;
+
+        delete[] weights.attn_q_w_scale; delete[] weights.attn_k_w_scale;
+        delete[] weights.attn_v_w_scale; delete[] weights.attn_o_w_scale;
+        delete[] weights.mlp_gate_w_scale; delete[] weights.mlp_up_w_scale;
+        delete[] weights.mlp_down_w_scale;
     }
 
     void init_cache() {
@@ -183,6 +206,37 @@ struct LlaisysQwen2Model {
         logits = Tensor::create({1, meta.voc}, LLAISYS_DTYPE_F32, device_type, device_id);
         next_token = Tensor::create({1}, LLAISYS_DTYPE_I32, device_type, device_id);
         max_val = Tensor::create({1}, LLAISYS_DTYPE_F32, device_type, device_id);
+    }
+
+    // 获取或创建 dequantize 临时缓冲区 (lazy allocation, keyed by shape)
+    tensor_t get_dequant_buf(size_t rows, size_t cols) {
+        uint64_t key = ((uint64_t)rows << 32) | (uint64_t)cols;
+        auto it = dequant_cache.find(key);
+        if (it != dequant_cache.end()) return it->second;
+        auto buf = Tensor::create({rows, cols}, LLAISYS_DTYPE_F32, device_type, device_id);
+        dequant_cache[key] = buf;
+        return buf;
+    }
+
+    // 量化感知的 linear 调用: 如果 weight 是 INT8 则先 dequantize
+    void linear_maybe_dequant(tensor_t out, tensor_t in,
+                              llaisysTensor_t w_handle, llaisysTensor_t scale_handle,
+                              llaisysTensor_t bias_handle) {
+        auto w = TO_CPP_TENSOR(w_handle);
+        auto b = TO_CPP_TENSOR(bias_handle);
+
+        if (w->dtype() == LLAISYS_DTYPE_I8 && scale_handle) {
+            // INT8 路径: dequantize → FP32 → linear
+            auto sc = TO_CPP_TENSOR(scale_handle);
+            size_t rows = w->shape()[0];
+            size_t cols = w->shape()[1];
+            auto dq_buf = get_dequant_buf(rows, cols);
+            ops::dequantize(dq_buf, w, sc);
+            ops::linear(out, in, dq_buf, b);
+        } else {
+            // FP32 / FP16 原始路径
+            ops::linear(out, in, w, b);
+        }
     }
 };
 
@@ -236,9 +290,9 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.attn_norm_w[i]), model->meta.epsilon);
 
             // B. QKV Linear
-            ops::linear(model->q, model->norm_out, TO_CPP_TENSOR(model->weights.attn_q_w[i]), TO_CPP_TENSOR(model->weights.attn_q_b[i]));
-            ops::linear(model->k, model->norm_out, TO_CPP_TENSOR(model->weights.attn_k_w[i]), TO_CPP_TENSOR(model->weights.attn_k_b[i]));
-            ops::linear(model->v, model->norm_out, TO_CPP_TENSOR(model->weights.attn_v_w[i]), TO_CPP_TENSOR(model->weights.attn_v_b[i]));
+            model->linear_maybe_dequant(model->q, model->norm_out, model->weights.attn_q_w[i], model->weights.attn_q_w_scale[i], model->weights.attn_q_b[i]);
+            model->linear_maybe_dequant(model->k, model->norm_out, model->weights.attn_k_w[i], model->weights.attn_k_w_scale[i], model->weights.attn_k_b[i]);
+            model->linear_maybe_dequant(model->v, model->norm_out, model->weights.attn_v_w[i], model->weights.attn_v_w_scale[i], model->weights.attn_v_b[i]);
 
             // C. RoPE
             auto q_3d = model->q->reshape({1, model->meta.nh, model->meta.dh});
@@ -266,7 +320,7 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
 
             // F. Output Projection
             auto attn_flat = model->attn_out->reshape({1, model->meta.hs});
-            ops::linear(model->hidden_states, attn_flat, TO_CPP_TENSOR(model->weights.attn_o_w[i]), nullptr);
+            model->linear_maybe_dequant(model->hidden_states, attn_flat, model->weights.attn_o_w[i], model->weights.attn_o_w_scale[i], nullptr);
 
             // G. Residual Add 1
             ops::add(model->hidden_states, model->hidden_states, model->residual);
@@ -275,12 +329,12 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             std::swap(model->residual, model->hidden_states);
             ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.mlp_norm_w[i]), model->meta.epsilon);
 
-            ops::linear(model->gate, model->norm_out, TO_CPP_TENSOR(model->weights.mlp_gate_w[i]), nullptr);
-            ops::linear(model->up, model->norm_out, TO_CPP_TENSOR(model->weights.mlp_up_w[i]), nullptr);
+            model->linear_maybe_dequant(model->gate, model->norm_out, model->weights.mlp_gate_w[i], model->weights.mlp_gate_w_scale[i], nullptr);
+            model->linear_maybe_dequant(model->up, model->norm_out, model->weights.mlp_up_w[i], model->weights.mlp_up_w_scale[i], nullptr);
             
             ops::swiglu(model->mlp_act, model->gate, model->up);
             
-            ops::linear(model->hidden_states, model->mlp_act, TO_CPP_TENSOR(model->weights.mlp_down_w[i]), nullptr);
+            model->linear_maybe_dequant(model->hidden_states, model->mlp_act, model->weights.mlp_down_w[i], model->weights.mlp_down_w_scale[i], nullptr);
 
             // I. Residual Add 2
             ops::add(model->hidden_states, model->hidden_states, model->residual);
@@ -290,7 +344,7 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
         ops::rms_norm(model->hidden_states, model->hidden_states, TO_CPP_TENSOR(model->weights.out_norm_w), model->meta.epsilon);
 
         // 5. LM Head
-        ops::linear(model->logits, model->hidden_states, TO_CPP_TENSOR(model->weights.out_embed), nullptr);
+        model->linear_maybe_dequant(model->logits, model->hidden_states, model->weights.out_embed, model->weights.out_embed_scale, nullptr);
 
         // 6. Argmax
         auto logits_2d = model->logits->reshape({1, model->meta.voc});
@@ -332,9 +386,9 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
             std::swap(model->residual, model->hidden_states);
             ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.attn_norm_w[i]), model->meta.epsilon);
 
-            ops::linear(model->q, model->norm_out, TO_CPP_TENSOR(model->weights.attn_q_w[i]), TO_CPP_TENSOR(model->weights.attn_q_b[i]));
-            ops::linear(model->k, model->norm_out, TO_CPP_TENSOR(model->weights.attn_k_w[i]), TO_CPP_TENSOR(model->weights.attn_k_b[i]));
-            ops::linear(model->v, model->norm_out, TO_CPP_TENSOR(model->weights.attn_v_w[i]), TO_CPP_TENSOR(model->weights.attn_v_b[i]));
+            model->linear_maybe_dequant(model->q, model->norm_out, model->weights.attn_q_w[i], model->weights.attn_q_w_scale[i], model->weights.attn_q_b[i]);
+            model->linear_maybe_dequant(model->k, model->norm_out, model->weights.attn_k_w[i], model->weights.attn_k_w_scale[i], model->weights.attn_k_b[i]);
+            model->linear_maybe_dequant(model->v, model->norm_out, model->weights.attn_v_w[i], model->weights.attn_v_w_scale[i], model->weights.attn_v_b[i]);
 
             auto q_3d = model->q->reshape({1, model->meta.nh, model->meta.dh});
             auto k_3d = model->k->reshape({1, model->meta.nkvh, model->meta.dh});
@@ -359,15 +413,15 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
             ops::self_attention(model->attn_out, q_3d, k_slice, v_slice, scale);
 
             auto attn_flat = model->attn_out->reshape({1, model->meta.hs});
-            ops::linear(model->hidden_states, attn_flat, TO_CPP_TENSOR(model->weights.attn_o_w[i]), nullptr);
+            model->linear_maybe_dequant(model->hidden_states, attn_flat, model->weights.attn_o_w[i], model->weights.attn_o_w_scale[i], nullptr);
             ops::add(model->hidden_states, model->hidden_states, model->residual);
 
             std::swap(model->residual, model->hidden_states);
             ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.mlp_norm_w[i]), model->meta.epsilon);
-            ops::linear(model->gate, model->norm_out, TO_CPP_TENSOR(model->weights.mlp_gate_w[i]), nullptr);
-            ops::linear(model->up, model->norm_out, TO_CPP_TENSOR(model->weights.mlp_up_w[i]), nullptr);
+            model->linear_maybe_dequant(model->gate, model->norm_out, model->weights.mlp_gate_w[i], model->weights.mlp_gate_w_scale[i], nullptr);
+            model->linear_maybe_dequant(model->up, model->norm_out, model->weights.mlp_up_w[i], model->weights.mlp_up_w_scale[i], nullptr);
             ops::swiglu(model->mlp_act, model->gate, model->up);
-            ops::linear(model->hidden_states, model->mlp_act, TO_CPP_TENSOR(model->weights.mlp_down_w[i]), nullptr);
+            model->linear_maybe_dequant(model->hidden_states, model->mlp_act, model->weights.mlp_down_w[i], model->weights.mlp_down_w_scale[i], nullptr);
             ops::add(model->hidden_states, model->hidden_states, model->residual);
         }
 
@@ -375,7 +429,7 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
         ops::rms_norm(model->hidden_states, model->hidden_states, TO_CPP_TENSOR(model->weights.out_norm_w), model->meta.epsilon);
 
         // 5. LM Head
-        ops::linear(model->logits, model->hidden_states, TO_CPP_TENSOR(model->weights.out_embed), nullptr);
+        model->linear_maybe_dequant(model->logits, model->hidden_states, model->weights.out_embed, model->weights.out_embed_scale, nullptr);
 
         // 6. Sampling or Argmax
         auto logits_2d = model->logits->reshape({1, model->meta.voc});
@@ -415,17 +469,30 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
 
     model->resources.push_back(tensor);
     llaisysTensor_t t_handle = reinterpret_cast<llaisysTensor_t>(tensor.get()); 
+
+    // 如果加载了 INT8 类型的权重，标记模型为量化模式
+    if ((llaisysDataType_t)dtype == LLAISYS_DTYPE_I8) {
+        model->has_quantized = true;
+    }
     
     std::string key(name);
-    if (key == "model.embed_tokens.weight") model->weights.in_embed = t_handle;
-    else if (key == "model.norm.weight") model->weights.out_norm_w = t_handle;
-    else if (key == "lm_head.weight") model->weights.out_embed = t_handle;
-    else if (key.find("model.layers.") == 0) {
+
+    // ── 处理 .scale 后缀 (量化 per-channel scale) ──
+    if (key == "lm_head.weight.scale") { model->weights.out_embed_scale = t_handle; return; }
+
+    // 顶层权重
+    if (key == "model.embed_tokens.weight") { model->weights.in_embed = t_handle; return; }
+    if (key == "model.norm.weight") { model->weights.out_norm_w = t_handle; return; }
+    if (key == "lm_head.weight") { model->weights.out_embed = t_handle; return; }
+
+    // 分层权重
+    if (key.find("model.layers.") == 0) {
         size_t first_dot = 13;
         size_t second_dot = key.find('.', first_dot);
         int layer_idx = std::stoi(key.substr(first_dot, second_dot - first_dot));
         std::string suffix = key.substr(second_dot + 1);
         
+        // 普通权重
         if (suffix == "input_layernorm.weight") model->weights.attn_norm_w[layer_idx] = t_handle;
         else if (suffix == "post_attention_layernorm.weight") model->weights.mlp_norm_w[layer_idx] = t_handle;
         else if (suffix == "self_attn.q_proj.weight") model->weights.attn_q_w[layer_idx] = t_handle;
@@ -438,6 +505,14 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
         else if (suffix == "mlp.gate_proj.weight") model->weights.mlp_gate_w[layer_idx] = t_handle;
         else if (suffix == "mlp.up_proj.weight") model->weights.mlp_up_w[layer_idx] = t_handle;
         else if (suffix == "mlp.down_proj.weight") model->weights.mlp_down_w[layer_idx] = t_handle;
+        // 量化 scale
+        else if (suffix == "self_attn.q_proj.weight.scale") model->weights.attn_q_w_scale[layer_idx] = t_handle;
+        else if (suffix == "self_attn.k_proj.weight.scale") model->weights.attn_k_w_scale[layer_idx] = t_handle;
+        else if (suffix == "self_attn.v_proj.weight.scale") model->weights.attn_v_w_scale[layer_idx] = t_handle;
+        else if (suffix == "self_attn.o_proj.weight.scale") model->weights.attn_o_w_scale[layer_idx] = t_handle;
+        else if (suffix == "mlp.gate_proj.weight.scale") model->weights.mlp_gate_w_scale[layer_idx] = t_handle;
+        else if (suffix == "mlp.up_proj.weight.scale") model->weights.mlp_up_w_scale[layer_idx] = t_handle;
+        else if (suffix == "mlp.down_proj.weight.scale") model->weights.mlp_down_w_scale[layer_idx] = t_handle;
     }
 }
 
@@ -561,6 +636,11 @@ __export struct LlaisysQwen2CacheSnapshot *llaisysKVCachePoolLookup(struct Llais
 __export void llaisysKVCachePoolClear(struct LlaisysKVCachePool * pool) {
     if (!pool) return;
     pool->clear();
+}
+
+__export int llaisysQwen2IsQuantized(struct LlaisysQwen2Model * model) {
+    if (!model) return 0;
+    return model->has_quantized ? 1 : 0;
 }
 
 } // extern "C"

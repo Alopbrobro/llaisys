@@ -29,6 +29,17 @@ __C {
         llaisysTensor_t *mlp_gate_w;
         llaisysTensor_t *mlp_up_w;
         llaisysTensor_t *mlp_down_w;
+
+        // INT8 量化 per-channel scale (shape [out_features], FP32)
+        // 当权重为 INT8 时使用, 否则为 nullptr
+        llaisysTensor_t out_embed_scale;
+        llaisysTensor_t *attn_q_w_scale;
+        llaisysTensor_t *attn_k_w_scale;
+        llaisysTensor_t *attn_v_w_scale;
+        llaisysTensor_t *attn_o_w_scale;
+        llaisysTensor_t *mlp_gate_w_scale;
+        llaisysTensor_t *mlp_up_w_scale;
+        llaisysTensor_t *mlp_down_w_scale;
     };
 
     // 不透明的模型句柄
@@ -99,5 +110,12 @@ __C {
 
     // 清空池中所有条目
     __export void llaisysKVCachePoolClear(struct LlaisysKVCachePool * pool);
+
+    // ==========================================
+    // 量化支持
+    // ==========================================
+
+    // 查询模型是否已加载量化权重
+    __export int llaisysQwen2IsQuantized(struct LlaisysQwen2Model * model);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

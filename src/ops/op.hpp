@@ -32,5 +32,8 @@ void swiglu(tensor_t out, tensor_t gate, tensor_t up);
 void sample(tensor_t out_idx, tensor_t logits,
             float temperature, int top_k, float top_p, uint64_t seed);
 
+// 9. Dequantize (INT8 → FP32, per-channel symmetric)
+void dequantize(tensor_t out, tensor_t weight, tensor_t scale);
+
 } // namespace ops
 } // namespace llaisys
