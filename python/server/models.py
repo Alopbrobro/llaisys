@@ -24,8 +24,50 @@ class ChatCompletionRequest(BaseModel):
     top_k: int = 50
     max_tokens: int = 512
     stream: bool = False
-    # Extension: session management (for Phase 4)
+    # Phase 4: session management
     session_id: Optional[str] = None
+
+
+# ── Phase 4: Session / Edit / Regenerate 请求 ──
+
+class CreateSessionRequest(BaseModel):
+    session_id: Optional[str] = None
+
+
+class EditMessageRequest(BaseModel):
+    session_id: str
+    message_index: int
+    new_content: str
+    # 编辑后是否立即重新生成
+    regenerate: bool = True
+    # 生成参数
+    temperature: float = 0.8
+    top_p: float = 0.9
+    top_k: int = 50
+    max_tokens: int = 512
+    stream: bool = False
+
+
+class RegenerateRequest(BaseModel):
+    session_id: str
+    temperature: float = 0.8
+    top_p: float = 0.9
+    top_k: int = 50
+    max_tokens: int = 512
+    stream: bool = False
+
+
+class SessionInfo(BaseModel):
+    session_id: str
+    message_count: int = 0
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    is_active: bool = False
+
+
+class SessionHistoryResponse(BaseModel):
+    session_id: str
+    messages: List[ChatMessage]
 
 
 # ── Response ─────────────────────────────────────────────────────────
@@ -65,6 +107,8 @@ class ChatCompletionResponse(BaseModel):
     model: str = "deepseek-r1-distill-qwen-1.5b"
     choices: List[ChatCompletionChoice]
     usage: UsageInfo = Field(default_factory=UsageInfo)
+    # Phase 4: 返回 session_id
+    session_id: Optional[str] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -73,3 +117,5 @@ class ChatCompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str = "deepseek-r1-distill-qwen-1.5b"
     choices: List[ChatCompletionStreamChoice]
+    session_id: Optional[str] = None
+

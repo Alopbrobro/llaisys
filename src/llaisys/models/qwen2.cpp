@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <random>
+#include <unordered_map>
 
 using namespace llaisys;
 
@@ -23,6 +24,40 @@ static inline tensor_t TO_CPP_TENSOR(llaisysTensor_t t) {
 // ==========================================
 // 2. 模型结构体定义
 // ==========================================
+
+// KV-Cache 快照 (CPU 侧存储)
+struct LlaisysQwen2CacheSnapshot {
+    int64_t pos;            // 保存时的 current_pos
+    size_t nlayer;           // transformer 层数
+    size_t pos_bytes;        // 每个位置每个 K/V 的字节数 = nkvh * dh * sizeof(float)
+    // buffers[layer * 2 + 0] = K, buffers[layer * 2 + 1] = V
+    // 每个 buffer 大小 = pos * pos_bytes
+    std::vector<std::vector<uint8_t>> buffers;
+};
+
+// 前缀树节点
+struct TrieNode {
+    std::unordered_map<int64_t, std::unique_ptr<TrieNode>> children;
+    LlaisysQwen2CacheSnapshot* snapshot = nullptr;  // 可能为 null
+
+    ~TrieNode() {
+        if (snapshot) {
+            delete snapshot;
+            snapshot = nullptr;
+        }
+    }
+};
+
+// KV-Cache 前缀树池
+struct LlaisysKVCachePool {
+    std::unique_ptr<TrieNode> root;
+
+    LlaisysKVCachePool() : root(std::make_unique<TrieNode>()) {}
+
+    void clear() {
+        root = std::make_unique<TrieNode>();
+    }
+};
 
 struct LlaisysQwen2Model {
     LlaisysQwen2Meta meta;
@@ -307,7 +342,8 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
 
             ops::rope(q_3d, q_3d, model->pos_ids_buf, model->meta.theta);
             ops::rope(k_3d, k_3d, model->pos_ids_buf, model->meta.theta);
-
+            
+            //kv cache
             if (model->current_pos < (int64_t)model->meta.maxseq) {
                 size_t bytes = model->meta.nkvh * model->meta.dh * 4;
                 char* k_dst = (char*)model->kv_caches[i][0]->data() + model->current_pos * bytes;
@@ -403,6 +439,128 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
         else if (suffix == "mlp.up_proj.weight") model->weights.mlp_up_w[layer_idx] = t_handle;
         else if (suffix == "mlp.down_proj.weight") model->weights.mlp_down_w[layer_idx] = t_handle;
     }
+}
+
+// ==========================================
+// 4. KV-Cache 高级接口
+// ==========================================
+
+__export struct LlaisysQwen2CacheSnapshot *llaisysQwen2SaveCache(struct LlaisysQwen2Model * model) {
+    if (!model || model->current_pos <= 0) return nullptr;
+
+    auto* snap = new LlaisysQwen2CacheSnapshot();
+    snap->pos = model->current_pos;
+    snap->nlayer = model->meta.nlayer;
+    snap->pos_bytes = model->meta.nkvh * model->meta.dh * sizeof(float);
+
+    size_t total_bytes_per_buf = snap->pos * snap->pos_bytes;
+    snap->buffers.resize(snap->nlayer * 2);
+
+    for (size_t i = 0; i < snap->nlayer; ++i) {
+        for (size_t kv = 0; kv < 2; ++kv) {
+            size_t idx = i * 2 + kv;
+            snap->buffers[idx].resize(total_bytes_per_buf);
+            // 从设备拷贝到 CPU
+            model->memcpyD2H(snap->buffers[idx].data(), model->kv_caches[i][kv], total_bytes_per_buf);
+        }
+    }
+
+    return snap;
+}
+
+__export void llaisysQwen2RestoreCache(struct LlaisysQwen2Model * model, struct LlaisysQwen2CacheSnapshot * snapshot) {
+    if (!model || !snapshot) return;
+    if (snapshot->nlayer != model->meta.nlayer) return;
+
+    model->current_pos = snapshot->pos;
+    size_t total_bytes = snapshot->pos * snapshot->pos_bytes;
+
+    for (size_t i = 0; i < snapshot->nlayer; ++i) {
+        for (size_t kv = 0; kv < 2; ++kv) {
+            size_t idx = i * 2 + kv;
+            // 从 CPU 拷贝回设备
+            model->memcpyH2D(model->kv_caches[i][kv], snapshot->buffers[idx].data(), total_bytes);
+        }
+    }
+}
+
+__export void llaisysQwen2TruncateCache(struct LlaisysQwen2Model * model, int64_t pos) {
+    if (!model) return;
+    if (pos < 0) pos = 0;
+    if (pos > model->current_pos) pos = model->current_pos;
+    model->current_pos = pos;
+}
+
+__export int64_t llaisysQwen2GetCachePos(struct LlaisysQwen2Model * model) {
+    if (!model) return 0;
+    return model->current_pos;
+}
+
+__export void llaisysQwen2DestroyCacheSnapshot(struct LlaisysQwen2CacheSnapshot * snapshot) {
+    if (snapshot) delete snapshot;
+}
+
+// ==========================================
+// 5. 前缀树 KV-Cache 池
+// ==========================================
+
+__export struct LlaisysKVCachePool *llaisysKVCachePoolCreate(void) {
+    return new LlaisysKVCachePool();
+}
+
+__export void llaisysKVCachePoolDestroy(struct LlaisysKVCachePool * pool) {
+    if (pool) delete pool;
+}
+
+__export void llaisysKVCachePoolInsert(struct LlaisysKVCachePool * pool, int64_t * tokens, size_t len, struct LlaisysQwen2CacheSnapshot * snapshot) {
+    if (!pool || !tokens || len == 0 || !snapshot) return;
+
+    TrieNode* node = pool->root.get();
+    for (size_t i = 0; i < len; ++i) {
+        int64_t tok = tokens[i];
+        auto it = node->children.find(tok);
+        if (it == node->children.end()) {
+            node->children[tok] = std::make_unique<TrieNode>();
+        }
+        node = node->children[tok].get();
+    }
+
+    // 替换已有快照
+    if (node->snapshot) {
+        delete node->snapshot;
+    }
+    node->snapshot = snapshot;  // 转移所有权
+}
+
+__export struct LlaisysQwen2CacheSnapshot *llaisysKVCachePoolLookup(struct LlaisysKVCachePool * pool, int64_t * tokens, size_t len, size_t * match_len) {
+    if (!pool || !tokens || len == 0) {
+        if (match_len) *match_len = 0;
+        return nullptr;
+    }
+
+    TrieNode* node = pool->root.get();
+    LlaisysQwen2CacheSnapshot* best = nullptr;
+    size_t best_len = 0;
+
+    for (size_t i = 0; i < len; ++i) {
+        int64_t tok = tokens[i];
+        auto it = node->children.find(tok);
+        if (it == node->children.end()) break;
+
+        node = it->second.get();
+        if (node->snapshot) {
+            best = node->snapshot;
+            best_len = i + 1;
+        }
+    }
+
+    if (match_len) *match_len = best_len;
+    return best;
+}
+
+__export void llaisysKVCachePoolClear(struct LlaisysKVCachePool * pool) {
+    if (!pool) return;
+    pool->clear();
 }
 
 } // extern "C"

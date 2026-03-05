@@ -5,184 +5,407 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LLAISYS Chat</title>
 <style>
+/* ── 全局重置与排版 ── */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: #1a1a2e;
-    color: #e0e0e0;
+    /* 使用现代系统字体，更贴近 ChatGPT 的阅读体验 */
+    font-family: Söhne, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #ffffff;
+    color: #0d0d0d;
     height: 100vh;
     display: flex;
-    flex-direction: column;
+    flex-direction: row; /* 侧边栏 + 主内容横向排列 */
 }
 
-/* ── Header ── */
+/* ── 侧边栏 ── */
+.sidebar {
+    width: 260px;
+    min-width: 260px;
+    background: #f9f9f9;
+    border-right: 1px solid #e5e5e5;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+.sidebar-new-btn {
+    margin: 16px;
+    padding: 12px;
+    border: 1px solid #e5e5e5;
+    background: #ffffff;
+    color: #0d0d0d;
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    text-align: center;
+    transition: background 0.2s;
+}
+.sidebar-new-btn:hover { background: #ececec; }
+.sidebar-list-title {
+    padding: 8px 16px;
+    font-size: 12px;
+    color: #999;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.sidebar-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 8px;
+}
+
+/* ── 主内容区 ── */
+.main-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+    position: relative; /* 供 settings-panel absolute 定位 */
+}
+
+/* ── 滚动条美化 ── */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d9d9d9; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #b3b3b3; }
+
+/* ── Header 顶部导航栏 ── */
 .header {
-    background: #16213e;
+    background: #ffffff;
     padding: 12px 20px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    border-bottom: 1px solid #0f3460;
+    border-bottom: 1px solid #e5e5e5;
     flex-shrink: 0;
 }
-.header h1 { font-size: 18px; color: #e94560; }
+.header h1 { font-size: 16px; color: #0d0d0d; font-weight: 600; }
 .header-actions { display: flex; gap: 8px; }
 .btn {
-    padding: 6px 14px;
-    border: 1px solid #0f3460;
-    background: #16213e;
-    color: #e0e0e0;
-    border-radius: 6px;
+    padding: 8px 14px;
+    border: 1px solid #e5e5e5;
+    background: #ffffff;
+    color: #0d0d0d;
+    border-radius: 8px;
     cursor: pointer;
-    font-size: 13px;
+    font-size: 14px;
+    font-weight: 500;
     transition: background 0.2s;
 }
-.btn:hover { background: #0f3460; }
-.btn-danger { border-color: #e94560; color: #e94560; }
-.btn-danger:hover { background: #e94560; color: #fff; }
+.btn:hover { background: #f9f9f9; }
+.btn-danger { background: #000000; color: #ffffff; border-color: #000000; }
+.btn-danger:hover { background: #333333; color: #ffffff; border-color: #333333; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
 
-/* ── Chat Area ── */
+/* ── Session Bar 会话状态栏 ── */
+.session-bar {
+    background: #f9f9f9;
+    padding: 8px 20px;
+    border-bottom: 1px solid #e5e5e5;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #666;
+    flex-shrink: 0;
+}
+.session-bar .session-id { color: #0d0d0d; font-family: ui-monospace, monospace; font-weight: 500; }
+.session-list-btn { cursor: pointer; text-decoration: underline; color: #000000; }
+
+/* ── Chat Area 聊天主区域 ── */
 .chat-container {
     flex: 1;
     overflow-y: auto;
-    padding: 20px;
+    padding: 40px 20px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    align-items: center; /* 确保所有对话框整体居中 */
+    gap: 32px; /* 消息之间的间距加大，更有呼吸感 */
 }
 
+/* 消息外层容器：固定最大宽度，实现经典居中阅读体验 */
 .message {
-    max-width: 80%;
-    padding: 12px 16px;
-    border-radius: 12px;
+    width: 100%;
+    max-width: 768px; 
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ── 你的消息 (You) ── */
+.message.user {
+    align-items: flex-end; /* 整体内容靠右 */
+}
+.message.user .role-tag {
+    font-size: 13px;
+    color: #666;
+    margin-bottom: 6px;
+    margin-right: 4px;
+    font-weight: 500;
+}
+.message.user .msg-body {
+    background: #f4f4f4; /* 浅灰色背景 */
+    color: #0d0d0d;
+    padding: 12px 20px;
+    border-radius: 20px;
+    border-bottom-right-radius: 4px; /* 右下角小折角 */
+    max-width: 85%;
+    font-size: 16px;
     line-height: 1.6;
-    font-size: 14px;
     white-space: pre-wrap;
     word-break: break-word;
 }
-.message.user {
-    align-self: flex-end;
-    background: #0f3460;
-    border-bottom-right-radius: 4px;
-}
-.message.assistant {
-    align-self: flex-start;
-    background: #16213e;
-    border: 1px solid #0f3460;
-    border-bottom-left-radius: 4px;
-}
-.message .role-tag {
-    font-size: 11px;
-    color: #888;
-    margin-bottom: 4px;
-}
-.message.user .role-tag { color: #5dade2; }
-.message.assistant .role-tag { color: #e94560; }
 
+/* ── AI 的消息 (Assistant) ── */
+.message.assistant {
+    align-items: flex-start; /* 整体内容靠左 */
+}
+.message.assistant .role-tag {
+    font-weight: 600;
+    font-size: 15px;
+    color: #0d0d0d;
+    margin-bottom: 8px;
+}
+.message.assistant .msg-body {
+    background: transparent; /* AI 消息无背景色 */
+    color: #0d0d0d;
+    padding: 0;
+    max-width: 100%;
+    font-size: 16px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* ── 悬浮操作按钮 (编辑/重新生成) ── */
+.msg-actions {
+    display: none;
+    position: absolute;
+    bottom: -32px; /* 悬浮在气泡正下方 */
+    gap: 8px;
+    z-index: 10;
+}
+.message.user .msg-actions { right: 0; }
+.message.assistant .msg-actions { left: 0; }
+.message:hover .msg-actions { display: flex; }
+.msg-action-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    border: 1px solid #e5e5e5;
+    background: #ffffff;
+    color: #666;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}
+.msg-action-btn:hover { background: #f9f9f9; color: #0d0d0d; }
+
+/* ── 打字机特效光标 ── */
 .typing-indicator {
     display: inline-block;
-    width: 8px; height: 8px;
-    background: #e94560;
+    width: 10px; height: 10px;
+    background: #0d0d0d; /* 黑色圆点 */
     border-radius: 50%;
     animation: blink 1s infinite;
     margin-left: 4px;
+    vertical-align: middle;
 }
 @keyframes blink { 0%,100%{opacity:.2} 50%{opacity:1} }
 
-/* ── Input Area ── */
+/* ── Input Area 底部输入区 ── */
 .input-area {
-    padding: 12px 20px;
-    background: #16213e;
-    border-top: 1px solid #0f3460;
+    width: 100%;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 10px 20px 30px;
+    background: transparent;
+    border: none;
     display: flex;
-    gap: 10px;
+    gap: 12px;
+    align-items: flex-end;
     flex-shrink: 0;
 }
 #msg-input {
     flex: 1;
-    padding: 10px 14px;
-    border: 1px solid #0f3460;
-    background: #1a1a2e;
-    color: #e0e0e0;
-    border-radius: 8px;
-    font-size: 14px;
+    padding: 14px 20px;
+    border: 1px solid #e5e5e5;
+    background: #f4f4f4;
+    color: #0d0d0d;
+    border-radius: 20px;
+    font-size: 16px;
+    line-height: 1.5;
     outline: none;
     resize: none;
-    min-height: 42px;
-    max-height: 120px;
+    min-height: 52px;
+    max-height: 200px;
     font-family: inherit;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
 }
-#msg-input:focus { border-color: #e94560; }
+#msg-input:focus { 
+    background: #ffffff; 
+    border-color: #cccccc; 
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08); 
+}
 #send-btn {
-    padding: 10px 20px;
-    background: #e94560;
-    color: #fff;
+    padding: 14px 24px;
+    border-radius: 20px;
+    background: #000000;
+    color: #ffffff;
     border: none;
-    border-radius: 8px;
     cursor: pointer;
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 600;
-    transition: background 0.2s;
-    align-self: flex-end;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.2s, background 0.2s;
+    height: 52px; /* 和输入框初始高度一致 */
 }
-#send-btn:hover { background: #c0392b; }
-#send-btn:disabled { background: #555; cursor: not-allowed; }
+#send-btn:hover { background: #333333; }
+#send-btn:disabled { background: #e5e5e5; color: #999; cursor: not-allowed; }
 
-/* ── Settings Panel ── */
+/* ── 悬浮设置面板 ── */
 .settings-panel {
     display: none;
     position: absolute;
-    top: 50px;
+    top: 60px;
     right: 20px;
-    background: #16213e;
-    border: 1px solid #0f3460;
-    border-radius: 8px;
-    padding: 16px;
+    background: #ffffff;
+    border: 1px solid #e5e5e5;
+    border-radius: 16px;
+    padding: 20px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.1);
     z-index: 10;
     min-width: 240px;
 }
 .settings-panel.open { display: block; }
-.settings-panel label {
-    display: block;
-    font-size: 12px;
-    color: #888;
-    margin-top: 10px;
-}
+
+.settings-panel label { display: block; font-size: 13px; color: #666; font-weight: 500; margin-top: 12px; }
 .settings-panel input {
     width: 100%;
-    padding: 6px 8px;
-    background: #1a1a2e;
-    border: 1px solid #0f3460;
-    color: #e0e0e0;
-    border-radius: 4px;
-    margin-top: 4px;
-    font-size: 13px;
+    padding: 8px 12px;
+    background: #ffffff;
+    border: 1px solid #e5e5e5;
+    color: #0d0d0d;
+    border-radius: 8px;
+    margin-top: 6px;
+    font-size: 14px;
 }
+.settings-panel input:focus { border-color: #000000; outline: none; }
+
+/* 会话列表项样式 (左侧边栏内) */
+.session-item {
+    padding: 10px 12px;
+    border: none;
+    margin-bottom: 0;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-radius: 8px;
+    transition: background 0.2s;
+}
+.session-item:hover { background: #ececec; }
+.session-item.active { background: #e5e5e5; }
+.session-item .sid { font-family: ui-monospace, monospace; font-size: 13px; font-weight: 500; color: #0d0d0d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
+.session-item .msg-count { font-size: 12px; color: #666; margin-top: 4px; }
+.session-item .del-btn { color: #999; cursor: pointer; font-size: 18px; padding: 0 4px; display: none; }
+.session-item:hover .del-btn { display: block; }
+.session-item .del-btn:hover { color: #ff4a4a; }
+
+/* ── Edit Modal 编辑弹窗 ── */
+.edit-modal {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.4);
+    backdrop-filter: blur(2px);
+    z-index: 100;
+    justify-content: center;
+    align-items: center;
+}
+.edit-modal.open { display: flex; }
+.edit-modal-content {
+    background: #ffffff;
+    border: none;
+    border-radius: 20px;
+    padding: 24px;
+    width: 90%;
+    max-width: 500px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.15);
+}
+.edit-modal-content h3 { color: #0d0d0d; margin-bottom: 16px; font-weight: 600; }
+.edit-modal-content textarea {
+    width: 100%;
+    min-height: 100px;
+    padding: 16px;
+    background: #f9f9f9;
+    border: 1px solid #e5e5e5;
+    color: #0d0d0d;
+    border-radius: 12px;
+    font-size: 15px;
+    resize: vertical;
+    font-family: inherit;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.02);
+}
+.edit-modal-content textarea:focus { border-color: #cccccc; outline: none; background: #ffffff; }
+.edit-modal-actions { display: flex; gap: 12px; margin-top: 16px; justify-content: flex-end; }
 </style>
 </head>
 <body>
-<div class="header">
-    <h1>LLAISYS Chat</h1>
-    <div class="header-actions">
-        <button class="btn" onclick="toggleSettings()">Settings</button>
-        <button class="btn btn-danger" onclick="newChat()">New Chat</button>
-    </div>
+
+<!-- ── 左侧边栏 ── -->
+<div class="sidebar">
+    <button class="sidebar-new-btn" onclick="newChat()">+ 新建对话</button>
+    <div class="sidebar-list-title">历史会话</div>
+    <div class="sidebar-list" id="sessions-list"></div>
 </div>
 
-<div class="settings-panel" id="settings-panel">
-    <label>Temperature
-        <input type="number" id="cfg-temp" value="0.8" step="0.1" min="0" max="2">
-    </label>
-    <label>Top-K
-        <input type="number" id="cfg-topk" value="50" min="1" max="200">
-    </label>
-    <label>Top-P
-        <input type="number" id="cfg-topp" value="0.9" step="0.05" min="0" max="1">
-    </label>
-    <label>Max Tokens
-        <input type="number" id="cfg-max" value="512" min="1" max="4096">
-    </label>
+<!-- ── 右侧主内容 ── -->
+<div class="main-content">
+    <div class="header">
+        <h1>LLAISYS Chat</h1>
+        <div class="header-actions">
+            <button class="btn" onclick="toggleSettings()">Settings</button>
+        </div>
+    </div>
+
+    <div class="session-bar">
+        <span>Session:</span>
+        <span class="session-id" id="current-session-id">-</span>
+    </div>
+
+    <div class="settings-panel" id="settings-panel">
+        <label>Temperature
+            <input type="number" id="cfg-temp" value="0.8" step="0.05" min="0" max="2">
+        </label>
+        <label>Top-K
+            <input type="number" id="cfg-topk" value="50" min="1" max="200">
+        </label>
+        <label>Top-P
+            <input type="number" id="cfg-topp" value="0.9" step="0.05" min="0" max="1">
+        </label>
+        <label>Max Tokens
+            <input type="number" id="cfg-max" value="512" min="1" max="4096">
+        </label>
+    </div>
+
+<!-- Edit Modal -->
+<div class="edit-modal" id="edit-modal">
+    <div class="edit-modal-content">
+        <h3>编辑消息</h3>
+        <textarea id="edit-textarea"></textarea>
+        <div class="edit-modal-actions">
+            <button class="btn" onclick="cancelEdit()">取消</button>
+            <button class="btn btn-danger" onclick="confirmEdit()">编辑并重新生成</button>
+        </div>
+    </div>
 </div>
 
 <div class="chat-container" id="chat-container"></div>
@@ -191,15 +414,32 @@ body {
     <textarea id="msg-input" rows="1" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"></textarea>
     <button id="send-btn" onclick="sendMessage()">发送</button>
 </div>
+</div> <!-- 闭合 main-content 容器 -->
 
 <script>
-const API_URL = window.location.origin + "/v1/chat/completions";
+const BASE_URL = window.location.origin;
+const API_URL = BASE_URL + "/v1/chat/completions";
 let history = [];
 let isGenerating = false;
+let currentSessionId = null;
+let editingIndex = -1;
 
 const chatContainer = document.getElementById("chat-container");
 const msgInput = document.getElementById("msg-input");
 const sendBtn = document.getElementById("send-btn");
+
+// ── Init: create session on load ──
+(async () => {
+    try {
+        const resp = await fetch(BASE_URL + "/v1/sessions", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
+        if (resp.ok) {
+            const data = await resp.json();
+            currentSessionId = data.session_id;
+            document.getElementById("current-session-id").textContent = currentSessionId;
+        }
+    } catch(e) { console.warn("Failed to create session:", e); }
+    await loadSessions(); // 初始化后自动拉取左侧列表
+})();
 
 // ── Auto-resize textarea ──
 msgInput.addEventListener("input", () => {
@@ -219,26 +459,264 @@ function toggleSettings() {
     document.getElementById("settings-panel").classList.toggle("open");
 }
 
-function newChat() {
+async function loadSessions() {
+    try {
+        const resp = await fetch(BASE_URL + "/v1/sessions");
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const list = document.getElementById("sessions-list");
+        list.innerHTML = "";
+        for (const s of data.sessions || []) {
+            const div = document.createElement("div");
+            div.className = "session-item" + (s.session_id === currentSessionId ? " active" : "");
+            div.innerHTML = `
+                <div>
+                    <div class="sid">${s.session_id}</div>
+                    <div class="msg-count">${s.message_count} 条消息</div>
+                </div>
+                <span class="del-btn" onclick="event.stopPropagation(); deleteSession('${s.session_id}')">&times;</span>
+            `;
+            div.addEventListener("click", () => switchSession(s.session_id));
+            list.appendChild(div);
+        }
+    } catch(e) { console.error(e); }
+}
+
+async function switchSession(sid) {
+    try {
+        const resp = await fetch(BASE_URL + `/v1/sessions/${sid}/switch`, { method: "POST" });
+        if (!resp.ok) return;
+        currentSessionId = sid;
+        document.getElementById("current-session-id").textContent = sid;
+
+        // Load history
+    const histResp = await fetch(BASE_URL + `/v1/sessions/${sid}`);
+    if (histResp.ok) {
+        const data = await histResp.json();
+        history = (data.messages || []).map(m => ({ role: m.role, content: m.content }));
+        renderAllMessages();
+    }
+    await loadSessions(); // 切换对话后，刷新一下列表的高亮状态
+} catch(e) { console.error(e); }
+}
+
+async function deleteSession(sid) {
+    try {
+        await fetch(BASE_URL + `/v1/sessions/${sid}`, { method: "DELETE" });
+        if (sid === currentSessionId) {
+            currentSessionId = null;
+            history = [];
+            chatContainer.innerHTML = "";
+            document.getElementById("current-session-id").textContent = "-";
+        }
+        await loadSessions();
+    } catch(e) { console.error(e); }
+}
+
+async function newChat() {
     history = [];
     chatContainer.innerHTML = "";
+    try {
+        const resp = await fetch(BASE_URL + "/v1/sessions", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+        if (resp.ok) {
+            const data = await resp.json();
+            currentSessionId = data.session_id;
+            document.getElementById("current-session-id").textContent = currentSessionId;
+        }
+    } catch(e) { console.error(e); }
+    await loadSessions(); // 新建对话后，刷新列表显示出来
     msgInput.focus();
 }
 
-function addMessage(role, content) {
+function renderAllMessages() {
+    chatContainer.innerHTML = "";
+    history.forEach((msg, idx) => addMessage(msg.role, msg.content, idx));
+}
+
+function addMessage(role, content, index) {
+    const idx = (index !== undefined) ? index : history.length - 1;
     const div = document.createElement("div");
     div.className = `message ${role}`;
+    div.dataset.index = idx;
+
     const tag = document.createElement("div");
     tag.className = "role-tag";
     tag.textContent = role === "user" ? "You" : "LLAISYS";
+
     const body = document.createElement("div");
     body.className = "msg-body";
     body.textContent = content;
+
+    // Action buttons
+    const actions = document.createElement("div");
+    actions.className = "msg-actions";
+
+    if (role === "user") {
+        const editBtn = document.createElement("button");
+        editBtn.className = "msg-action-btn";
+        editBtn.textContent = "编辑";
+        editBtn.onclick = () => openEditModal(idx);
+        actions.appendChild(editBtn);
+    } else if (role === "assistant") {
+        const regenBtn = document.createElement("button");
+        regenBtn.className = "msg-action-btn";
+        regenBtn.textContent = "重新生成";
+        regenBtn.onclick = () => regenerate();
+        actions.appendChild(regenBtn);
+    }
+
+    div.appendChild(actions);
     div.appendChild(tag);
     div.appendChild(body);
     chatContainer.appendChild(div);
     chatContainer.scrollTop = chatContainer.scrollHeight;
     return body;
+}
+
+// ── Edit Modal ──
+function openEditModal(index) {
+    editingIndex = index;
+    document.getElementById("edit-textarea").value = history[index].content;
+    document.getElementById("edit-modal").classList.add("open");
+}
+
+function cancelEdit() {
+    editingIndex = -1;
+    document.getElementById("edit-modal").classList.remove("open");
+}
+
+async function confirmEdit() {
+    const newContent = document.getElementById("edit-textarea").value.trim();
+    if (!newContent || editingIndex < 0) { cancelEdit(); return; }
+
+    document.getElementById("edit-modal").classList.remove("open");
+
+    if (isGenerating) return;
+    isGenerating = true;
+    sendBtn.disabled = true;
+
+    const cfg = getConfig();
+
+    // Truncate local history
+    history = history.slice(0, editingIndex);
+    history.push({ role: "user", content: newContent });
+    renderAllMessages();
+
+    // Create assistant bubble
+    const botBody = addMessage("assistant", "", history.length);
+    botBody.innerHTML = '<span class="typing-indicator"></span>';
+
+    try {
+        const resp = await fetch(BASE_URL + "/v1/edit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                session_id: currentSessionId,
+                message_index: editingIndex,
+                new_content: newContent,
+                regenerate: true,
+                stream: true,
+                ...cfg,
+            }),
+        });
+
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+        const assistantText = await readSSEStream(resp, botBody);
+        history.push({ role: "assistant", content: assistantText });
+        if (!assistantText) botBody.textContent = "(空回复)";
+    } catch(err) {
+        botBody.textContent = `[错误] ${err.message}`;
+        botBody.style.color = "#ff4a4a";
+    }
+
+    isGenerating = false;
+    sendBtn.disabled = false;
+    editingIndex = -1;
+    msgInput.focus();
+}
+
+// ── Regenerate ──
+async function regenerate() {
+    if (isGenerating) return;
+    if (!history.length || history[history.length - 1].role !== "assistant") return;
+
+    isGenerating = true;
+    sendBtn.disabled = true;
+
+    history.pop();
+    renderAllMessages();
+
+    const botBody = addMessage("assistant", "", history.length);
+    botBody.innerHTML = '<span class="typing-indicator"></span>';
+
+    const cfg = getConfig();
+
+    try {
+        const resp = await fetch(BASE_URL + "/v1/regenerate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                session_id: currentSessionId,
+                stream: true,
+                ...cfg,
+            }),
+        });
+
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+        const assistantText = await readSSEStream(resp, botBody);
+        history.push({ role: "assistant", content: assistantText });
+        if (!assistantText) botBody.textContent = "(空回复)";
+    } catch(err) {
+        botBody.textContent = `[错误] ${err.message}`;
+        botBody.style.color = "#ff4a4a";
+    }
+
+    isGenerating = false;
+    sendBtn.disabled = false;
+    msgInput.focus();
+}
+
+function getConfig() {
+    return {
+        temperature: parseFloat(document.getElementById("cfg-temp").value) || 0.8,
+        top_k: parseInt(document.getElementById("cfg-topk").value) || 50,
+        top_p: parseFloat(document.getElementById("cfg-topp").value) || 0.9,
+        max_tokens: parseInt(document.getElementById("cfg-max").value) || 512,
+    };
+}
+
+async function readSSEStream(resp, bodyEl) {
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    let buffer = "";
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+
+        for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6);
+            if (data === "[DONE]") continue;
+            try {
+                const chunk = JSON.parse(data);
+                const content = chunk.choices?.[0]?.delta?.content;
+                if (content) {
+                    text += content;
+                    bodyEl.textContent = text;
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
+            } catch(e) { /* skip */ }
+        }
+    }
+    return text;
 }
 
 async function sendMessage() {
@@ -252,16 +730,13 @@ async function sendMessage() {
 
     // Add user message
     history.push({ role: "user", content: text });
-    addMessage("user", text);
+    addMessage("user", text, history.length - 1);
 
     // Create assistant bubble
-    const botBody = addMessage("assistant", "");
+    const botBody = addMessage("assistant", "", history.length);
     botBody.innerHTML = '<span class="typing-indicator"></span>';
 
-    const temperature = parseFloat(document.getElementById("cfg-temp").value) || 0.8;
-    const top_k = parseInt(document.getElementById("cfg-topk").value) || 50;
-    const top_p = parseFloat(document.getElementById("cfg-topp").value) || 0.9;
-    const max_tokens = parseInt(document.getElementById("cfg-max").value) || 512;
+    const cfg = getConfig();
 
     try {
         const resp = await fetch(API_URL, {
@@ -269,49 +744,21 @@ async function sendMessage() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 messages: history,
-                temperature, top_k, top_p, max_tokens,
                 stream: true,
+                session_id: currentSessionId,
+                ...cfg,
             }),
         });
 
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let assistantText = "";
-        let buffer = "";
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop(); // keep incomplete line
-
-            for (const line of lines) {
-                if (!line.startsWith("data: ")) continue;
-                const data = line.slice(6);
-                if (data === "[DONE]") continue;
-
-                try {
-                    const chunk = JSON.parse(data);
-                    const content = chunk.choices?.[0]?.delta?.content;
-                    if (content) {
-                        assistantText += content;
-                        botBody.textContent = assistantText;
-                        chatContainer.scrollTop = chatContainer.scrollHeight;
-                    }
-                } catch (e) { /* skip bad chunk */ }
-            }
-        }
-
+        const assistantText = await readSSEStream(resp, botBody);
         history.push({ role: "assistant", content: assistantText });
         if (!assistantText) botBody.textContent = "(空回复)";
 
     } catch (err) {
         botBody.textContent = `[错误] ${err.message}`;
-        botBody.style.color = "#e94560";
+        botBody.style.color = "#ff4a4a";
         history.pop(); // remove failed user message
     }
 

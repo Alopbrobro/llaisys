@@ -75,6 +75,70 @@ def _setup_functions():
         lib.llaisysQwen2ResetCache.argtypes = [ctypes.c_void_p]
         lib.llaisysQwen2ResetCache.restype = None
 
+    # ── Phase 4: KV-Cache 高级接口 ──
+
+    # SaveCache
+    if hasattr(lib, 'llaisysQwen2SaveCache'):
+        lib.llaisysQwen2SaveCache.argtypes = [ctypes.c_void_p]
+        lib.llaisysQwen2SaveCache.restype = ctypes.c_void_p
+
+    # RestoreCache
+    if hasattr(lib, 'llaisysQwen2RestoreCache'):
+        lib.llaisysQwen2RestoreCache.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.llaisysQwen2RestoreCache.restype = None
+
+    # TruncateCache
+    if hasattr(lib, 'llaisysQwen2TruncateCache'):
+        lib.llaisysQwen2TruncateCache.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+        lib.llaisysQwen2TruncateCache.restype = None
+
+    # GetCachePos
+    if hasattr(lib, 'llaisysQwen2GetCachePos'):
+        lib.llaisysQwen2GetCachePos.argtypes = [ctypes.c_void_p]
+        lib.llaisysQwen2GetCachePos.restype = ctypes.c_int64
+
+    # DestroyCacheSnapshot
+    if hasattr(lib, 'llaisysQwen2DestroyCacheSnapshot'):
+        lib.llaisysQwen2DestroyCacheSnapshot.argtypes = [ctypes.c_void_p]
+        lib.llaisysQwen2DestroyCacheSnapshot.restype = None
+
+    # ── Phase 4: 前缀树 KV-Cache 池 ──
+
+    # KVCachePoolCreate
+    if hasattr(lib, 'llaisysKVCachePoolCreate'):
+        lib.llaisysKVCachePoolCreate.argtypes = []
+        lib.llaisysKVCachePoolCreate.restype = ctypes.c_void_p
+
+    # KVCachePoolDestroy
+    if hasattr(lib, 'llaisysKVCachePoolDestroy'):
+        lib.llaisysKVCachePoolDestroy.argtypes = [ctypes.c_void_p]
+        lib.llaisysKVCachePoolDestroy.restype = None
+
+    # KVCachePoolInsert
+    if hasattr(lib, 'llaisysKVCachePoolInsert'):
+        lib.llaisysKVCachePoolInsert.argtypes = [
+            ctypes.c_void_p,                # pool
+            ctypes.POINTER(ctypes.c_int64), # tokens
+            ctypes.c_size_t,                # len
+            ctypes.c_void_p,                # snapshot
+        ]
+        lib.llaisysKVCachePoolInsert.restype = None
+
+    # KVCachePoolLookup
+    if hasattr(lib, 'llaisysKVCachePoolLookup'):
+        lib.llaisysKVCachePoolLookup.argtypes = [
+            ctypes.c_void_p,                 # pool
+            ctypes.POINTER(ctypes.c_int64),  # tokens
+            ctypes.c_size_t,                 # len
+            ctypes.POINTER(ctypes.c_size_t), # match_len (output)
+        ]
+        lib.llaisysKVCachePoolLookup.restype = ctypes.c_void_p
+
+    # KVCachePoolClear
+    if hasattr(lib, 'llaisysKVCachePoolClear'):
+        lib.llaisysKVCachePoolClear.argtypes = [ctypes.c_void_p]
+        lib.llaisysKVCachePoolClear.restype = None
+
 # 执行配置
 _setup_functions()
 
@@ -85,3 +149,16 @@ load_weight = LIB_LLAISYS.llaisysQwen2LoadWeightByName
 model_infer = LIB_LLAISYS.llaisysQwen2ModelInfer
 model_infer_sample = LIB_LLAISYS.llaisysQwen2ModelInferSample
 model_reset_cache = LIB_LLAISYS.llaisysQwen2ResetCache
+
+# Phase 4 导出
+cache_save = LIB_LLAISYS.llaisysQwen2SaveCache
+cache_restore = LIB_LLAISYS.llaisysQwen2RestoreCache
+cache_truncate = LIB_LLAISYS.llaisysQwen2TruncateCache
+cache_get_pos = LIB_LLAISYS.llaisysQwen2GetCachePos
+cache_snapshot_destroy = LIB_LLAISYS.llaisysQwen2DestroyCacheSnapshot
+
+pool_create = LIB_LLAISYS.llaisysKVCachePoolCreate
+pool_destroy = LIB_LLAISYS.llaisysKVCachePoolDestroy
+pool_insert = LIB_LLAISYS.llaisysKVCachePoolInsert
+pool_lookup = LIB_LLAISYS.llaisysKVCachePoolLookup
+pool_clear = LIB_LLAISYS.llaisysKVCachePoolClear

@@ -1,6 +1,12 @@
 """
 LLAISYS Chat Server — OpenAI-compatible Chat Completion API.
 
+Phase 4 新增功能:
+  - 多会话管理 (创建/切换/删除/列表)
+  - KV-Cache 快照保存/恢复
+  - 编辑历史消息 + 重新生成
+  - 前缀树 KV-Cache 池 (自动复用已计算的 KV-Cache)
+
 Usage:
     python -m server.app --model /path/to/model [--host 0.0.0.0] [--port 8000]
 
@@ -16,7 +22,7 @@ import sys
 import os
 import time
 import uuid
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 # Ensure the llaisys package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -36,14 +42,22 @@ from server.models import (
     ChatMessageResponse,
     ChoiceDelta,
     UsageInfo,
+    # Phase 4 models
+    CreateSessionRequest,
+    EditMessageRequest,
+    RegenerateRequest,
+    SessionInfo,
+    SessionHistoryResponse,
+    ChatMessage,
 )
+from server.session import SessionManager
 
 import llaisys
 from llaisys.libllaisys import DeviceType
 
 # ── Globals (initialised in startup) ─────────────────────────────────
 
-app = FastAPI(title="LLAISYS Chat Server", version="0.1.0")
+app = FastAPI(title="LLAISYS Chat Server", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,12 +70,13 @@ MODEL: llaisys.models.Qwen2 | None = None
 TOKENIZER = None
 MODEL_PATH: str = ""
 DEVICE: DeviceType = DeviceType.CPU
+SESSION_MGR: SessionManager | None = None
 
 # ── Model Management ─────────────────────────────────────────────────
 
 def load_model(model_path: str, device: str = "cpu") -> None:
     """Load model and tokenizer (called once at startup)."""
-    global MODEL, TOKENIZER, MODEL_PATH, DEVICE
+    global MODEL, TOKENIZER, MODEL_PATH, DEVICE, SESSION_MGR
 
     from transformers import AutoTokenizer
     from huggingface_hub import snapshot_download
@@ -84,7 +99,10 @@ def load_model(model_path: str, device: str = "cpu") -> None:
 
     print(f"Loading LLAISYS model from {resolved_path} (device={device}) ...")
     MODEL = llaisys.models.Qwen2(resolved_path, DEVICE)
-    print("Model ready.")
+
+    # Phase 4: 初始化 Session Manager
+    SESSION_MGR = SessionManager(MODEL)
+    print("Model ready. Session manager initialized.")
 
 
 def _reset_model() -> None:
@@ -105,14 +123,23 @@ def _encode_messages(messages: list) -> list[int]:
     return TOKENIZER.encode(text)
 
 
+def _ensure_session(session_id: Optional[str]) -> str:
+    """确保 session 存在且已激活, 返回 session_id."""
+    session = SESSION_MGR.activate_or_create(session_id)
+    return session.session_id
+
+
 # ── Non-streaming endpoint ───────────────────────────────────────────
 
-def _generate_full(request: ChatCompletionRequest) -> ChatCompletionResponse:
+def _generate_full(request: ChatCompletionRequest, session_id: str) -> ChatCompletionResponse:
     """Generate a complete response (blocking)."""
     _reset_model()
 
     input_ids = _encode_messages(request.messages)
     prompt_tokens = len(input_ids)
+
+    # 记录 prefill 前的 cache 位置
+    cache_pos_before = MODEL.get_cache_pos()
 
     output_ids = MODEL.generate(
         input_ids,
@@ -126,6 +153,19 @@ def _generate_full(request: ChatCompletionRequest) -> ChatCompletionResponse:
     new_tokens = output_ids[prompt_tokens:]
     text = TOKENIZER.decode(new_tokens, skip_special_tokens=True)
     completion_tokens = len(new_tokens)
+
+    # Session: 记录用户消息和 assistant 消息
+    cache_pos_after_prefill = prompt_tokens  # prefill 后的位置
+    cache_pos_after_gen = MODEL.get_cache_pos()
+
+    for msg in request.messages:
+        SESSION_MGR.add_message(session_id, msg.role, msg.content)
+
+    SESSION_MGR.add_message(
+        session_id, "assistant", text,
+        cache_start_pos=cache_pos_after_prefill,
+        cache_end_pos=cache_pos_after_gen,
+    )
 
     return ChatCompletionResponse(
         model=request.model,
@@ -141,12 +181,13 @@ def _generate_full(request: ChatCompletionRequest) -> ChatCompletionResponse:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
         ),
+        session_id=session_id,
     )
 
 
 # ── Streaming endpoint ───────────────────────────────────────────────
 
-async def _generate_stream(request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
+async def _generate_stream(request: ChatCompletionRequest, session_id: str) -> AsyncGenerator[str, None]:
     """Yield SSE chunks, one per generated token."""
     _reset_model()
 
@@ -166,10 +207,12 @@ async def _generate_stream(request: ChatCompletionRequest) -> AsyncGenerator[str
                 finish_reason=None,
             )
         ],
+        session_id=session_id,
     )
     yield f"data: {initial_chunk.model_dump_json()}\n\n"
 
     # Stream tokens
+    generated_tokens = []
     for token_id in MODEL.generate_stream(
         input_ids,
         max_new_tokens=request.max_tokens,
@@ -180,6 +223,7 @@ async def _generate_stream(request: ChatCompletionRequest) -> AsyncGenerator[str
         if token_id == 151643:  # EOS
             break
 
+        generated_tokens.append(token_id)
         text = TOKENIZER.decode([token_id], skip_special_tokens=True)
         if not text:
             continue
@@ -195,6 +239,7 @@ async def _generate_stream(request: ChatCompletionRequest) -> AsyncGenerator[str
                     finish_reason=None,
                 )
             ],
+            session_id=session_id,
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
 
@@ -210,9 +255,138 @@ async def _generate_stream(request: ChatCompletionRequest) -> AsyncGenerator[str
                 finish_reason="stop",
             )
         ],
+        session_id=session_id,
     )
     yield f"data: {final_chunk.model_dump_json()}\n\n"
     yield "data: [DONE]\n\n"
+
+    # Session: 记录消息
+    full_text = TOKENIZER.decode(generated_tokens, skip_special_tokens=True)
+    cache_pos_after = MODEL.get_cache_pos()
+    prefill_len = len(input_ids)
+
+    for msg in request.messages:
+        SESSION_MGR.add_message(session_id, msg.role, msg.content)
+
+    SESSION_MGR.add_message(
+        session_id, "assistant", full_text,
+        cache_start_pos=prefill_len,
+        cache_end_pos=cache_pos_after,
+    )
+
+
+# ── Regeneration helpers ─────────────────────────────────────────────
+
+def _regenerate_full(session_id: str, request: RegenerateRequest) -> ChatCompletionResponse:
+    """重新生成: 删除最后一条 assistant 消息, 从 truncated cache 重新推理."""
+    truncate_pos, removed = SESSION_MGR.prepare_regenerate(session_id)
+
+    # 获取会话中剩余的历史消息
+    history = SESSION_MGR.get_history(session_id)
+    if not history:
+        raise HTTPException(status_code=400, detail="No messages to regenerate from")
+
+    # 用剩余历史重新编码并生成
+    input_ids = _encode_messages([ChatMessage(**m) for m in history])
+
+    _reset_model()
+    output_ids = MODEL.generate(
+        input_ids,
+        max_new_tokens=request.max_tokens,
+        top_k=request.top_k,
+        top_p=request.top_p,
+        temperature=request.temperature,
+    )
+
+    new_tokens = output_ids[len(input_ids):]
+    text = TOKENIZER.decode(new_tokens, skip_special_tokens=True)
+
+    cache_pos = MODEL.get_cache_pos()
+    SESSION_MGR.add_message(
+        session_id, "assistant", text,
+        cache_start_pos=len(input_ids),
+        cache_end_pos=cache_pos,
+    )
+
+    return ChatCompletionResponse(
+        model="deepseek-r1-distill-qwen-1.5b",
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=ChatMessageResponse(role="assistant", content=text),
+                finish_reason="stop",
+            )
+        ],
+        usage=UsageInfo(
+            prompt_tokens=len(input_ids),
+            completion_tokens=len(new_tokens),
+            total_tokens=len(input_ids) + len(new_tokens),
+        ),
+        session_id=session_id,
+    )
+
+
+async def _regenerate_stream(session_id: str, request: RegenerateRequest) -> AsyncGenerator[str, None]:
+    """流式重新生成."""
+    truncate_pos, removed = SESSION_MGR.prepare_regenerate(session_id)
+
+    history = SESSION_MGR.get_history(session_id)
+    if not history:
+        yield 'data: {"error": "No messages to regenerate from"}\n\n'
+        return
+
+    input_ids = _encode_messages([ChatMessage(**m) for m in history])
+
+    _reset_model()
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    initial_chunk = ChatCompletionStreamResponse(
+        id=chat_id, created=created,
+        model="deepseek-r1-distill-qwen-1.5b",
+        choices=[ChatCompletionStreamChoice(index=0, delta=ChoiceDelta(role="assistant"), finish_reason=None)],
+        session_id=session_id,
+    )
+    yield f"data: {initial_chunk.model_dump_json()}\n\n"
+
+    generated_tokens = []
+    for token_id in MODEL.generate_stream(
+        input_ids,
+        max_new_tokens=request.max_tokens,
+        top_k=request.top_k,
+        top_p=request.top_p,
+        temperature=request.temperature,
+    ):
+        if token_id == 151643:
+            break
+        generated_tokens.append(token_id)
+        text = TOKENIZER.decode([token_id], skip_special_tokens=True)
+        if not text:
+            continue
+        chunk = ChatCompletionStreamResponse(
+            id=chat_id, created=created,
+            model="deepseek-r1-distill-qwen-1.5b",
+            choices=[ChatCompletionStreamChoice(index=0, delta=ChoiceDelta(content=text), finish_reason=None)],
+            session_id=session_id,
+        )
+        yield f"data: {chunk.model_dump_json()}\n\n"
+
+    final_chunk = ChatCompletionStreamResponse(
+        id=chat_id, created=created,
+        model="deepseek-r1-distill-qwen-1.5b",
+        choices=[ChatCompletionStreamChoice(index=0, delta=ChoiceDelta(), finish_reason="stop")],
+        session_id=session_id,
+    )
+    yield f"data: {final_chunk.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
+
+    full_text = TOKENIZER.decode(generated_tokens, skip_special_tokens=True)
+    cache_pos = MODEL.get_cache_pos()
+    SESSION_MGR.add_message(
+        session_id, "assistant", full_text,
+        cache_start_pos=len(input_ids),
+        cache_end_pos=cache_pos,
+    )
 
 
 # ── Routes ───────────────────────────────────────────────────────────
@@ -222,13 +396,15 @@ async def chat_completions(request: ChatCompletionRequest):
     if MODEL is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
+    session_id = _ensure_session(request.session_id)
+
     if request.stream:
         return StreamingResponse(
-            _generate_stream(request),
+            _generate_stream(request, session_id),
             media_type="text/event-stream",
         )
 
-    return _generate_full(request)
+    return _generate_full(request, session_id)
 
 
 @app.get("/v1/models")
@@ -248,6 +424,141 @@ async def list_models():
 @app.get("/health")
 async def health():
     return {"status": "ok", "model_loaded": MODEL is not None}
+
+
+# ── Phase 4: Session Management Routes ───────────────────────────────
+
+@app.post("/v1/sessions")
+async def create_session(request: CreateSessionRequest = None):
+    """创建新会话."""
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    req = request or CreateSessionRequest()
+    session = SESSION_MGR.create_session(req.session_id)
+    return SessionInfo(
+        session_id=session.session_id,
+        message_count=0,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        is_active=False,
+    )
+
+
+@app.get("/v1/sessions")
+async def list_sessions():
+    """列出所有会话."""
+    if SESSION_MGR is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    sessions = SESSION_MGR.list_sessions()
+    return {"sessions": [SessionInfo(**s) for s in sessions]}
+
+
+@app.get("/v1/sessions/{session_id}")
+async def get_session_history(session_id: str):
+    """获取指定会话的对话历史."""
+    if SESSION_MGR is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    session = SESSION_MGR.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    history = SESSION_MGR.get_history(session_id)
+    return SessionHistoryResponse(
+        session_id=session_id,
+        messages=[ChatMessage(**m) for m in history],
+    )
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """删除指定会话."""
+    if SESSION_MGR is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    ok = SESSION_MGR.delete_session(session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return {"status": "deleted", "session_id": session_id}
+
+
+@app.post("/v1/sessions/{session_id}/switch")
+async def switch_session(session_id: str):
+    """切换到指定会话 (保存当前会话的 KV-Cache, 恢复目标会话)."""
+    if SESSION_MGR is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    ok = SESSION_MGR.switch_session(session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return {"status": "switched", "session_id": session_id}
+
+
+# ── Phase 4: Edit / Regenerate Routes ────────────────────────────────
+
+@app.post("/v1/edit")
+async def edit_message(request: EditMessageRequest):
+    """编辑指定位置的消息, 截断后续对话, 可选重新生成."""
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    session_id = request.session_id
+    session = SESSION_MGR.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    try:
+        truncate_pos, removed = SESSION_MGR.edit_message(
+            session_id, request.message_index, request.new_content
+        )
+    except (ValueError, IndexError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 添加编辑后的消息
+    SESSION_MGR.add_message(session_id, "user", request.new_content)
+
+    if not request.regenerate:
+        return {
+            "status": "edited",
+            "session_id": session_id,
+            "truncated_to": truncate_pos,
+            "removed_messages": removed,
+        }
+
+    # 编辑后重新生成
+    regen_req = RegenerateRequest(
+        session_id=session_id,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        top_k=request.top_k,
+        max_tokens=request.max_tokens,
+        stream=request.stream,
+    )
+
+    if request.stream:
+        return StreamingResponse(
+            _regenerate_stream(session_id, regen_req),
+            media_type="text/event-stream",
+        )
+
+    return _regenerate_full(session_id, regen_req)
+
+
+@app.post("/v1/regenerate")
+async def regenerate(request: RegenerateRequest):
+    """重新生成最后一条 assistant 回复."""
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    session = SESSION_MGR.get_session(request.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Session {request.session_id} not found")
+
+    SESSION_MGR.switch_session(request.session_id)
+
+    if request.stream:
+        return StreamingResponse(
+            _regenerate_stream(request.session_id, request),
+            media_type="text/event-stream",
+        )
+
+    return _regenerate_full(request.session_id, request)
 
 
 # ── Static files (Web UI) ───────────────────────────────────────────

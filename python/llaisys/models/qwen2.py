@@ -12,7 +12,19 @@ from ..libllaisys.qwen2 import (
     load_weight, 
     model_infer,
     model_infer_sample,
-    model_reset_cache
+    model_reset_cache,
+    # Phase 4: KV-Cache 高级接口
+    cache_save,
+    cache_restore,
+    cache_truncate,
+    cache_get_pos,
+    cache_snapshot_destroy,
+    # Phase 4: 前缀树 KV-Cache 池
+    pool_create,
+    pool_destroy,
+    pool_insert,
+    pool_lookup,
+    pool_clear,
 )
 
 from pathlib import Path
@@ -221,3 +233,109 @@ class Qwen2:
     def reset_cache(self):
         """Reset the KV-cache position without reloading weights."""
         model_reset_cache(self.model_handle)
+
+    # ==========================================
+    # Phase 4: KV-Cache 高级接口
+    # ==========================================
+
+    def save_cache(self):
+        """保存当前 KV-Cache 快照 (深拷贝到 CPU).
+        
+        Returns:
+            int: 快照句柄 (C++ 指针), 如果 cache 为空则返回 None.
+        """
+        handle = cache_save(self.model_handle)
+        if not handle:
+            return None
+        return handle
+
+    def restore_cache(self, snapshot_handle):
+        """从快照恢复 KV-Cache.
+        
+        Args:
+            snapshot_handle: save_cache() 返回的快照句柄.
+        """
+        if snapshot_handle:
+            cache_restore(self.model_handle, snapshot_handle)
+
+    def truncate_cache(self, pos: int):
+        """截断 KV-Cache 到指定位置.
+        
+        Args:
+            pos: 目标位置 (0 = 清空, pos <= current_pos).
+        """
+        cache_truncate(self.model_handle, ctypes.c_int64(pos))
+
+    def get_cache_pos(self) -> int:
+        """获取当前 KV-Cache 位置 (已处理的 token 数)."""
+        return int(cache_get_pos(self.model_handle))
+
+    @staticmethod
+    def destroy_snapshot(snapshot_handle):
+        """释放快照内存.
+        
+        Args:
+            snapshot_handle: save_cache() 返回的快照句柄.
+        """
+        if snapshot_handle:
+            cache_snapshot_destroy(snapshot_handle)
+
+    # ==========================================
+    # Phase 4: 前缀树 KV-Cache 池
+    # ==========================================
+
+    def create_cache_pool(self):
+        """创建 KV-Cache 前缀树池.
+        
+        Returns:
+            int: 池句柄.
+        """
+        return pool_create()
+
+    @staticmethod
+    def destroy_cache_pool(pool_handle):
+        """销毁 KV-Cache 前缀树池."""
+        if pool_handle:
+            pool_destroy(pool_handle)
+
+    @staticmethod
+    def cache_pool_insert(pool_handle, tokens: Sequence[int], snapshot_handle):
+        """向前缀树池插入快照 (池获取所有权).
+        
+        Args:
+            pool_handle: create_cache_pool() 返回的池句柄.
+            tokens: token 序列 (前缀).
+            snapshot_handle: save_cache() 返回的快照句柄, 插入后调用者不再拥有.
+        """
+        if not pool_handle or not snapshot_handle or not tokens:
+            return
+        token_np = np.array(tokens, dtype=np.int64)
+        token_ptr = token_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+        pool_insert(pool_handle, token_ptr, ctypes.c_size_t(len(tokens)), snapshot_handle)
+
+    @staticmethod
+    def cache_pool_lookup(pool_handle, tokens: Sequence[int]):
+        """在前缀树池中查找最长前缀匹配.
+        
+        Args:
+            pool_handle: 池句柄.
+            tokens: 要匹配的 token 序列.
+            
+        Returns:
+            tuple: (snapshot_handle or None, match_len: int)
+        """
+        if not pool_handle or not tokens:
+            return None, 0
+        token_np = np.array(tokens, dtype=np.int64)
+        token_ptr = token_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+        match_len = ctypes.c_size_t(0)
+        snap = pool_lookup(pool_handle, token_ptr, ctypes.c_size_t(len(tokens)), ctypes.byref(match_len))
+        if not snap:
+            return None, 0
+        return snap, int(match_len.value)
+
+    @staticmethod
+    def cache_pool_clear(pool_handle):
+        """清空前缀树池."""
+        if pool_handle:
+            pool_clear(pool_handle)
