@@ -93,7 +93,7 @@ def load_model(model_path: str, device: str = "cpu") -> None:
 
     print(f"Loading tokenizer from {resolved_path} ...")
     TOKENIZER = AutoTokenizer.from_pretrained(
-        "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        resolved_path,
         trust_remote_code=True,
     )
 

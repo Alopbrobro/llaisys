@@ -32,6 +32,21 @@ import safetensors
 import os
 
 # =========================================================================
+# GPTQ/AWQ format constants
+# =========================================================================
+
+# GPTQ quantized weight suffixes (without the .qweight etc.)
+GPTQ_LINEAR_SUFFIXES = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+]
+
+# =========================================================================
 # 强制覆盖函数签名 (确保指针类型正确)
 # =========================================================================
 model_create.argtypes = [ctypes.POINTER(LlaisysQwen2Meta), ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
@@ -98,11 +113,137 @@ class Qwen2:
         if "int8" in dtype_str: return 3
         return 0
 
+    # =====================================================================
+    # GPTQ/AWQ format helpers
+    # =====================================================================
+
+    @staticmethod
+    def _unpack_int32_to_int4(packed_int32, bits=4):
+        """Unpack int32-packed values to individual uint8 values.
+
+        GPTQ packing: 8 × 4-bit values per int32 (for bits=4).
+        qweight shape [rows_packed, cols] → [rows_packed * pack_factor, cols]
+        qzeros  shape [num_groups, cols_packed] → [num_groups, cols_packed * pack_factor]
+        """
+        pack_factor = 32 // bits  # 8 for 4-bit
+        mask = (1 << bits) - 1    # 0xF for 4-bit
+
+        results = []
+        for i in range(pack_factor):
+            results.append(((packed_int32 >> (i * bits)) & mask).to(torch.int32))
+        # Interleave along the packed axis
+        return results, pack_factor
+
+    @staticmethod
+    def _convert_gptq_layer(qweight, qzeros, scales, bits=4, group_size=128):
+        """Convert one GPTQ/AWQ linear layer to our symmetric INT4 format.
+
+        Args:
+            qweight: [in_features // pack_factor, out_features] int32
+            qzeros:  [num_groups, out_features // pack_factor] int32
+            scales:  [num_groups, out_features] float16/float32
+            bits:    quantization bits (4)
+            group_size: elements per group
+
+        Returns:
+            packed:  [out_features, in_features // 2] uint8 (our format)
+            scale:   [out_features, num_groups] float32 (our format)
+        """
+        pack_factor = 32 // bits  # 8 for 4-bit
+        mask = (1 << bits) - 1    # 0xF
+
+        in_packed, out_features = qweight.shape
+        in_features = in_packed * pack_factor
+        num_groups = scales.shape[0]
+
+        # --- Step 1: Unpack qweight [in_packed, out] → [in, out] ---
+        w_unpacked = torch.zeros(in_features, out_features, dtype=torch.int32)
+        for i in range(pack_factor):
+            w_unpacked[i::pack_factor, :] = (qweight >> (i * bits)) & mask
+
+        # --- Step 2: Unpack qzeros [ngroup, out_packed] → [ngroup, out] ---
+        z_unpacked = torch.zeros(num_groups, out_features, dtype=torch.int32)
+        for i in range(pack_factor):
+            z_unpacked[:, i::pack_factor] = (qzeros >> (i * bits)) & mask
+
+        # --- Step 3: Dequantize to FP32 ---
+        # w_float[row][col] = (w_unpacked[row][col] - (z[group][col] + 1)) * s[group][col]
+        # Note: AutoGPTQ stores zero_point - 1, so we add 1 back
+        scales_f32 = scales.float()
+        w_float = torch.zeros(in_features, out_features, dtype=torch.float32)
+        for g in range(num_groups):
+            r_start = g * group_size
+            r_end = min(r_start + group_size, in_features)
+            w_slice = w_unpacked[r_start:r_end, :].float()  # [gs, out]
+            z_row = (z_unpacked[g, :].float() + 1.0).unsqueeze(0)  # [1, out], +1 correction
+            s_row = scales_f32[g, :].unsqueeze(0)            # [1, out]
+            w_float[r_start:r_end, :] = (w_slice - z_row) * s_row
+
+        # --- Step 4: Transpose to our [out, in] layout ---
+        w_float = w_float.T.contiguous()  # [out_features, in_features]
+
+        # --- Step 5: Re-quantize to our symmetric INT4 per-group ---
+        rows, cols = w_float.shape
+        assert cols % group_size == 0, f"in_features {cols} not divisible by group_size {group_size}"
+        ngroups = cols // group_size
+
+        w_grouped = w_float.reshape(rows, ngroups, group_size)
+        group_max = w_grouped.abs().amax(dim=-1).clamp(min=1e-10)  # [rows, ngroups]
+        our_scale = group_max / 7.0
+
+        w_q = (w_grouped / our_scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
+        w_q = w_q.reshape(rows, cols)
+
+        # Pack two INT4 per byte
+        w_even = (w_q[:, 0::2] + 8).to(torch.uint8)  # [rows, cols/2]
+        w_odd  = (w_q[:, 1::2] + 8).to(torch.uint8)
+        packed = (w_odd << 4) | (w_even & 0x0F)       # [rows, cols/2] uint8
+
+        return packed, our_scale.float()
+
+    def _call_load_weight(self, name, tensor, dtype_enum):
+        """Helper to call the C load_weight function with proper ctypes."""
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        c_name = name.encode('utf-8')
+        data_ptr = tensor.data_ptr()
+        ndim = len(tensor.shape)
+        shape_array = (ctypes.c_int64 * ndim)(*tensor.shape)
+        load_weight(self.model_handle, c_name, ctypes.c_void_p(data_ptr), ndim, shape_array, dtype_enum)
+
     def _load_weights(self, model_path):
         import json
         
-        # 检测是否是量化模型 (有 quant_config.json)
-        quant_config_path = model_path / "quant_config.json"
+        # ─── Detect quantization format ───
+        quant_config_path = model_path / "quant_config.json"       # Our native format
+        gptq_config_path = model_path / "quantize_config.json"     # GPTQ / AWQ standalone
+        config_json_path = model_path / "config.json"              # HF config (may embed GPTQ config)
+
+        # GPTQ/AWQ: standalone quantize_config.json OR embedded in config.json
+        gcfg = None
+        if gptq_config_path.exists():
+            with open(gptq_config_path) as f:
+                gcfg = json.load(f)
+        elif config_json_path.exists():
+            with open(config_json_path) as f:
+                main_cfg = json.load(f)
+            if "quantization_config" in main_cfg:
+                qc = main_cfg["quantization_config"]
+                if qc.get("quant_method") in ("gptq", "awq"):
+                    gcfg = qc
+
+        if gcfg is not None:
+            quant_method = gcfg.get("quant_method", "gptq")
+            bits = gcfg.get("bits", 4)
+            group_size = gcfg.get("group_size", 128)
+            desc_act = gcfg.get("desc_act", False)
+            if desc_act:
+                print("WARNING: desc_act=True 暂不支持, 视为 False (可能影响精度)")
+            print(f"Detected {quant_method.upper()} model: {bits}-bit, group_size={group_size}")
+            self._load_weights_gptq(model_path, bits, group_size)
+            return
+
+        # ─── Our native format (INT8 / INT4 / FP32) ───
         is_quantized = quant_config_path.exists()
         quant_bits = 0
         if is_quantized:
@@ -149,6 +290,92 @@ class Qwen2:
                     shape_array = (ctypes.c_int64 * ndim)(*tensor.shape)
                     
                     load_weight(self.model_handle, c_name, ctypes.c_void_p(data_ptr), ndim, shape_array, dtype_enum)
+
+    def _load_weights_gptq(self, model_path, bits=4, group_size=128):
+        """Load GPTQ/AWQ format model, converting to our symmetric INT4 at load time.
+        
+        GPTQ tensors per linear layer:
+          .qweight → [in_features // 8, out_features] int32
+          .qzeros  → [num_groups, out_features // 8] int32
+          .scales  → [num_groups, out_features] float16
+          .g_idx   → [in_features] int32 (optional, ignored)
+        
+        Non-linear tensors (embed, norm, bias) are loaded as FP32.
+        """
+        files = sorted(list(model_path.glob("*.safetensors")))
+        if not files:
+            print(f"Warning: No .safetensors files found in {model_path}")
+            return
+
+        # First pass: collect all tensors into dict
+        all_tensors = {}
+        for file in files:
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    all_tensors[name] = f.get_tensor(name)
+
+        processed = set()
+        converted_count = 0
+
+        for name in sorted(all_tensors.keys()):
+            if name in processed:
+                continue
+            tensor = all_tensors[name]
+
+            if name.endswith(".qweight"):
+                # ─── GPTQ quantized linear layer ───
+                base = name[:-len(".qweight")]
+                qweight = tensor
+                qzeros = all_tensors.get(base + ".qzeros")
+                scales = all_tensors.get(base + ".scales")
+
+                if qzeros is None or scales is None:
+                    print(f"  WARNING: Missing qzeros/scales for {base}, loading as FP32")
+                    continue
+
+                # Convert GPTQ → our symmetric INT4
+                packed, our_scale = self._convert_gptq_layer(
+                    qweight, qzeros, scales, bits=bits, group_size=group_size)
+
+                # Map to our weight naming convention
+                weight_name = base + ".weight"
+                scale_name = base + ".weight.scale"
+
+                self._call_load_weight(weight_name, packed, dtype_enum=7)   # U8
+                self._call_load_weight(scale_name, our_scale, dtype_enum=13) # FP32
+
+                processed.update([name, base + ".qzeros", base + ".scales"])
+                if base + ".g_idx" in all_tensors:
+                    processed.add(base + ".g_idx")
+                if base + ".bias" in all_tensors:
+                    # GPTQ linear may have bias — load as FP32
+                    bias = all_tensors[base + ".bias"]
+                    if bias.dtype != torch.float32:
+                        bias = bias.to(torch.float32)
+                    self._call_load_weight(base + ".bias", bias, dtype_enum=13)
+                    processed.add(base + ".bias")
+
+                converted_count += 1
+                print(f"  [GPTQ→INT4] {weight_name}: {list(packed.shape)} + scale {list(our_scale.shape)}")
+
+            elif name.endswith((".qzeros", ".scales", ".g_idx")):
+                # Handled together with .qweight
+                continue
+
+            else:
+                # ─── Regular tensor (embedding, norm, bias, lm_head) ───
+                if tensor.dtype != torch.float32:
+                    tensor = tensor.to(torch.float32)
+
+                # lm_head.weight in GPTQ is sometimes still quantized
+                if name == "lm_head.weight" and "lm_head.qweight" in all_tensors:
+                    continue  # handled above
+
+                self._call_load_weight(name, tensor, dtype_enum=13)
+                processed.add(name)
+                print(f"  [KEEP]  {name}: {list(tensor.shape)} → float32")
+
+        print(f"  Converted {converted_count} GPTQ layers to symmetric INT4")
 
     def generate(
         self,
