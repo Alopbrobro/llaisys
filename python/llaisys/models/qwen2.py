@@ -79,30 +79,107 @@ model_infer_sample.restype = ctypes.c_int64
 # =========================================================================
 
 class Qwen2:
-    def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
-        # 初始化配置
+    # =====================================================================
+    # 默认架构参数（DeepSeek-R1-Distill-Qwen-1.5B）
+    # 当 config.json 缺少某项时用作回退
+    # =====================================================================
+    _DEFAULT_CONFIG = {
+        "num_hidden_layers": 28,
+        "hidden_size": 1536,
+        "num_attention_heads": 12,
+        "num_key_value_heads": 2,
+        "intermediate_size": 8960,
+        "vocab_size": 151936,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "eos_token_id": 151643,
+        "max_position_embeddings": 131072,
+        "sliding_window": 4096,
+    }
+
+    def __init__(self, model_path, device: DeviceType = DeviceType.CPU,
+                 max_seq_len: int | None = None):
+        model_path = Path(model_path)
+
+        # ─── 从 config.json 读取架构参数 ───
+        cfg = self._load_model_config(model_path)
+
+        num_hidden_layers   = cfg.get("num_hidden_layers",   self._DEFAULT_CONFIG["num_hidden_layers"])
+        hidden_size         = cfg.get("hidden_size",         self._DEFAULT_CONFIG["hidden_size"])
+        num_attention_heads = cfg.get("num_attention_heads", self._DEFAULT_CONFIG["num_attention_heads"])
+        num_key_value_heads = cfg.get("num_key_value_heads", self._DEFAULT_CONFIG["num_key_value_heads"])
+        intermediate_size   = cfg.get("intermediate_size",   self._DEFAULT_CONFIG["intermediate_size"])
+        vocab_size          = cfg.get("vocab_size",          self._DEFAULT_CONFIG["vocab_size"])
+        rms_norm_eps        = cfg.get("rms_norm_eps",        self._DEFAULT_CONFIG["rms_norm_eps"])
+        rope_theta          = cfg.get("rope_theta",          self._DEFAULT_CONFIG["rope_theta"])
+
+        # eos_token_id 可能是 int 或 list
+        eos_raw = cfg.get("eos_token_id", self._DEFAULT_CONFIG["eos_token_id"])
+        end_token = eos_raw[0] if isinstance(eos_raw, list) else int(eos_raw)
+
+        # maxseq：优先用户显式指定 > sliding_window > 上限 max_position_embeddings (截断到 32768 防爆显存)
+        if max_seq_len is not None:
+            maxseq = max_seq_len
+        else:
+            sw = cfg.get("sliding_window")
+            if sw is not None and isinstance(sw, int) and sw > 0:
+                maxseq = sw
+            else:
+                maxseq = min(cfg.get("max_position_embeddings",
+                                     self._DEFAULT_CONFIG["max_position_embeddings"]),
+                             32768)
+
+        head_dim = hidden_size // num_attention_heads
+
+        print(f"[Qwen2] Architecture from config.json:")
+        print(f"  layers={num_hidden_layers}, hidden={hidden_size}, heads={num_attention_heads}, "
+              f"kv_heads={num_key_value_heads}, head_dim={head_dim}")
+        print(f"  intermediate={intermediate_size}, vocab={vocab_size}, maxseq={maxseq}")
+        print(f"  rope_theta={rope_theta}, rms_eps={rms_norm_eps}, eos={end_token}")
+
+        # ─── 填充 meta 结构体 ───
         meta = LlaisysQwen2Meta()
-        meta.dtype = 13 
-        meta.nlayer = 28
-        meta.hs = 1536
-        meta.nh = 12
-        meta.nkvh = 2
-        meta.dh = 128
-        meta.di = 8960
-        meta.maxseq = 4096
-        meta.voc = 151936
-        meta.epsilon = 1e-6
-        meta.theta = 10000.0
-        meta.end_token = 151643
+        meta.dtype     = 13          # FP32 计算精度
+        meta.nlayer    = num_hidden_layers
+        meta.hs        = hidden_size
+        meta.nh        = num_attention_heads
+        meta.nkvh      = num_key_value_heads
+        meta.dh        = head_dim
+        meta.di        = intermediate_size
+        meta.maxseq    = maxseq
+        meta.voc       = vocab_size
+        meta.epsilon   = rms_norm_eps
+        meta.theta     = rope_theta
+        meta.end_token = end_token
 
         print("Creating Qwen2 Model instance...")
         self.model_handle = model_create(ctypes.byref(meta), device.value, None, 0)
 
+        # 保存配置供后续使用
+        self._config = cfg
+        self._end_token = end_token
+
         # 加载权重
-        model_path = Path(model_path)
         print(f"Loading weights from {model_path}...")
         self._load_weights(model_path)
         print("Model loaded successfully.")
+
+    @staticmethod
+    def _load_model_config(model_path: Path) -> dict:
+        """从 model_path/config.json 读取模型架构配置.
+
+        Returns:
+            dict: 解析后的配置字典, 若文件不存在则返回空 dict.
+        """
+        import json as _json
+        config_path = model_path / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = _json.load(f)
+            print(f"[Qwen2] Loaded config from {config_path}")
+            return cfg
+        print(f"[Qwen2] WARNING: {config_path} not found, using default config")
+        return {}
 
     def _get_dtype_enum(self, dtype_str):
         if "float32" in dtype_str: return 13
@@ -136,14 +213,12 @@ class Qwen2:
 
     @staticmethod
     def _convert_gptq_layer(qweight, qzeros, scales, bits=4, group_size=128):
-        """Convert one GPTQ/AWQ linear layer to our symmetric INT4 format.
+        """Convert one GPTQ linear layer to our symmetric INT4 format.
 
-        Args:
+        GPTQ packing: input dimension is packed.
             qweight: [in_features // pack_factor, out_features] int32
             qzeros:  [num_groups, out_features // pack_factor] int32
             scales:  [num_groups, out_features] float16/float32
-            bits:    quantization bits (4)
-            group_size: elements per group
 
         Returns:
             packed:  [out_features, in_features // 2] uint8 (our format)
@@ -167,37 +242,91 @@ class Qwen2:
             z_unpacked[:, i::pack_factor] = (qzeros >> (i * bits)) & mask
 
         # --- Step 3: Dequantize to FP32 ---
-        # w_float[row][col] = (w_unpacked[row][col] - (z[group][col] + 1)) * s[group][col]
-        # Note: AutoGPTQ stores zero_point - 1, so we add 1 back
+        # AutoGPTQ stores zero_point - 1, so we add 1 back
         scales_f32 = scales.float()
         w_float = torch.zeros(in_features, out_features, dtype=torch.float32)
         for g in range(num_groups):
             r_start = g * group_size
             r_end = min(r_start + group_size, in_features)
-            w_slice = w_unpacked[r_start:r_end, :].float()  # [gs, out]
-            z_row = (z_unpacked[g, :].float() + 1.0).unsqueeze(0)  # [1, out], +1 correction
-            s_row = scales_f32[g, :].unsqueeze(0)            # [1, out]
+            w_slice = w_unpacked[r_start:r_end, :].float()
+            z_row = (z_unpacked[g, :].float() + 1.0).unsqueeze(0)  # +1 correction for GPTQ
+            s_row = scales_f32[g, :].unsqueeze(0)
             w_float[r_start:r_end, :] = (w_slice - z_row) * s_row
 
-        # --- Step 4: Transpose to our [out, in] layout ---
+        # --- Step 4: Transpose to our [out, in] layout & re-quantize ---
         w_float = w_float.T.contiguous()  # [out_features, in_features]
+        return Qwen2._requantize_to_int4(w_float, group_size)
 
-        # --- Step 5: Re-quantize to our symmetric INT4 per-group ---
+    @staticmethod
+    def _convert_awq_layer(qweight, qzeros, scales, bits=4, group_size=128):
+        """Convert one AWQ GEMM format linear layer to our symmetric INT4 format.
+
+        AWQ GEMM packing: output dimension is packed.
+            qweight: [in_features, out_features // pack_factor] int32
+            qzeros:  [num_groups, out_features // pack_factor] int32
+            scales:  [num_groups, out_features] float16/float32
+        Groups are along the in_features dimension.
+
+        Returns:
+            packed:  [out_features, in_features // 2] uint8 (our format)
+            scale:   [out_features, num_groups] float32 (our format)
+        """
+        pack_factor = 32 // bits  # 8 for 4-bit
+        mask = (1 << bits) - 1    # 0xF
+
+        in_features, out_packed = qweight.shape
+        out_features = out_packed * pack_factor
+        num_groups = scales.shape[0]
+
+        # --- Step 1: Unpack qweight [in, out_packed] → [in, out] ---
+        w_unpacked = torch.zeros(in_features, out_features, dtype=torch.int32)
+        for i in range(pack_factor):
+            w_unpacked[:, i::pack_factor] = (qweight >> (i * bits)) & mask
+
+        # --- Step 2: Unpack qzeros [ngroup, out_packed] → [ngroup, out] ---
+        z_unpacked = torch.zeros(num_groups, out_features, dtype=torch.int32)
+        for i in range(pack_factor):
+            z_unpacked[:, i::pack_factor] = (qzeros >> (i * bits)) & mask
+
+        # --- Step 3: Dequantize to FP32 ---
+        # AWQ: w_float = (w_uint4 - zero_point) * scale  (no +1 correction)
+        scales_f32 = scales.float()
+        w_float = torch.zeros(in_features, out_features, dtype=torch.float32)
+        for g in range(num_groups):
+            r_start = g * group_size
+            r_end = min(r_start + group_size, in_features)
+            w_slice = w_unpacked[r_start:r_end, :].float()
+            z_row = z_unpacked[g, :].float().unsqueeze(0)  # no +1 for AWQ
+            s_row = scales_f32[g, :].unsqueeze(0)
+            w_float[r_start:r_end, :] = (w_slice - z_row) * s_row
+
+        # --- Step 4: Transpose to our [out, in] layout & re-quantize ---
+        w_float = w_float.T.contiguous()  # [out_features, in_features]
+        return Qwen2._requantize_to_int4(w_float, group_size)
+
+    @staticmethod
+    def _requantize_to_int4(w_float, group_size):
+        """Re-quantize FP32 weight [out, in] to our symmetric INT4 packed format.
+
+        Returns:
+            packed:  [out_features, in_features // 2] uint8
+            scale:   [out_features, num_groups] float32
+        """
         rows, cols = w_float.shape
         assert cols % group_size == 0, f"in_features {cols} not divisible by group_size {group_size}"
         ngroups = cols // group_size
 
         w_grouped = w_float.reshape(rows, ngroups, group_size)
-        group_max = w_grouped.abs().amax(dim=-1).clamp(min=1e-10)  # [rows, ngroups]
+        group_max = w_grouped.abs().amax(dim=-1).clamp(min=1e-10)
         our_scale = group_max / 7.0
 
         w_q = (w_grouped / our_scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
         w_q = w_q.reshape(rows, cols)
 
         # Pack two INT4 per byte
-        w_even = (w_q[:, 0::2] + 8).to(torch.uint8)  # [rows, cols/2]
+        w_even = (w_q[:, 0::2] + 8).to(torch.uint8)
         w_odd  = (w_q[:, 1::2] + 8).to(torch.uint8)
-        packed = (w_odd << 4) | (w_even & 0x0F)       # [rows, cols/2] uint8
+        packed = (w_odd << 4) | (w_even & 0x0F)
 
         return packed, our_scale.float()
 
@@ -240,7 +369,7 @@ class Qwen2:
             if desc_act:
                 print("WARNING: desc_act=True 暂不支持, 视为 False (可能影响精度)")
             print(f"Detected {quant_method.upper()} model: {bits}-bit, group_size={group_size}")
-            self._load_weights_gptq(model_path, bits, group_size)
+            self._load_weights_gptq(model_path, bits, group_size, quant_method=quant_method)
             return
 
         # ─── Our native format (INT8 / INT4 / FP32) ───
@@ -291,17 +420,22 @@ class Qwen2:
                     
                     load_weight(self.model_handle, c_name, ctypes.c_void_p(data_ptr), ndim, shape_array, dtype_enum)
 
-    def _load_weights_gptq(self, model_path, bits=4, group_size=128):
+    def _load_weights_gptq(self, model_path, bits=4, group_size=128, quant_method="gptq"):
         """Load GPTQ/AWQ format model, converting to our symmetric INT4 at load time.
-        
-        GPTQ tensors per linear layer:
+
+        GPTQ packing (input packed):
           .qweight → [in_features // 8, out_features] int32
+        AWQ GEMM packing (output packed):
+          .qweight → [in_features, out_features // 8] int32
+        Both share:
           .qzeros  → [num_groups, out_features // 8] int32
           .scales  → [num_groups, out_features] float16
           .g_idx   → [in_features] int32 (optional, ignored)
-        
+
         Non-linear tensors (embed, norm, bias) are loaded as FP32.
         """
+        is_awq = (quant_method == "awq")
+        convert_fn = self._convert_awq_layer if is_awq else self._convert_gptq_layer
         files = sorted(list(model_path.glob("*.safetensors")))
         if not files:
             print(f"Warning: No .safetensors files found in {model_path}")
@@ -333,8 +467,8 @@ class Qwen2:
                     print(f"  WARNING: Missing qzeros/scales for {base}, loading as FP32")
                     continue
 
-                # Convert GPTQ → our symmetric INT4
-                packed, our_scale = self._convert_gptq_layer(
+                # Convert GPTQ/AWQ → our symmetric INT4
+                packed, our_scale = convert_fn(
                     qweight, qzeros, scales, bits=bits, group_size=group_size)
 
                 # Map to our weight naming convention
@@ -356,7 +490,8 @@ class Qwen2:
                     processed.add(base + ".bias")
 
                 converted_count += 1
-                print(f"  [GPTQ→INT4] {weight_name}: {list(packed.shape)} + scale {list(our_scale.shape)}")
+                tag = "AWQ→INT4" if is_awq else "GPTQ→INT4"
+                print(f"  [{tag}] {weight_name}: {list(packed.shape)} + scale {list(our_scale.shape)}")
 
             elif name.endswith((".qzeros", ".scales", ".g_idx")):
                 # Handled together with .qweight
@@ -425,7 +560,7 @@ class Qwen2:
             output_ids.append(int(next_token))
             current_token = next_token
             
-            if next_token == 151643: # EOS
+            if next_token == self._end_token:  # EOS
                 break
 
         return output_ids
@@ -465,7 +600,7 @@ class Qwen2:
         
         # Decode
         for _ in range(max_tokens - 1):
-            if current_token == 151643:  # EOS
+            if current_token == self._end_token:  # EOS
                 break
             token_np = np.array([current_token], dtype=np.int64)
             token_ptr = token_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
