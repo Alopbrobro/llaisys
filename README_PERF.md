@@ -25,6 +25,46 @@ LLAISYS 是一个从零实现的轻量级 LLM 推理引擎。在完成全部 8 �
        ×2 加速              ×1.03 加速          ×21 加速
 ```
 
+### 1.1 2026-03 量化迭代补充（INT8 / INT4 / GPTQ/AWQ）
+
+在上述 GPU 基础优化完成后，新增了 Weight-Only 量化链路，并完成了端到端验证：
+
+- **INT8 W8A16（per-channel symmetric）**：约 **2x** 压缩
+- **INT4 W4A16（per-group symmetric, g=128）**：约 **3.76x** 压缩
+- **GPTQ/AWQ 兼容**：加载时在 Python 侧转换到内部 INT4 打包格式（无需新增 C++ 推理 API）
+- **INT4 CUDA kernel 优化**：从「1 输出/线程」改为「1 packed byte/线程（2 输出）」，减少重复读取与线程调度开销
+
+快速复现实验命令：
+
+```bash
+# 1) INT8 量化
+python3 scripts/quantize.py \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --output ./quantized_model \
+  --bits 8
+
+# 2) INT4 量化
+python3 scripts/quantize.py \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --output ./quantized_model_int4 \
+  --bits 4 --group-size 128
+
+# 3) 启动 INT4 服务
+cd python && python3 -m server.app \
+  --model /home/bbq/llaisys/quantized_model_int4 \
+  --device nvidia --port 8000
+
+# 4) GPTQ/AWQ 模型直接加载（若 config.json 含 quantization_config）
+cd python && python3 -m server.app \
+  --model <hf_repo_or_local_snapshot> \
+  --device nvidia --port 8000
+```
+
+说明：
+
+- `python/server/app.py` 已改为从 **resolved model path** 加载 tokenizer，支持本地快照与离线场景
+- GPTQ 格式使用 `qweight/qzeros/scales` 转换时包含 **zero-point +1 修正**（兼容 AutoGPTQ 常见存储约定）
+
 ---
 
 ## 二、性能分析方法论
