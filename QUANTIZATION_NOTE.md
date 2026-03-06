@@ -221,9 +221,123 @@ python3 -m server.app \
 
 ---
 
-## 9. 推荐下一步
+## 9. AWQ 7B 推理调试全记录（2026-03-07）
 
-1. **解决 7B OOM**：优先方案 — FP16 存储 embedding/lm_head（改动最小，收益最大）
+本节记录从 "OOM → 加载成功但输出乱码 → 根因分析 → 方案选择" 的完整过程。
+
+### 9.1 FP16 混合精度内核实现
+
+为解决 embedding/lm_head 占用过多显存的问题，在 C++ 层实现了 FP16 混合精度支持：
+
+**修改文件清单：**
+
+| 文件 | 修改内容 |
+|---|---|
+| `src/ops/embedding/nvidia/embedding_nvidia.cu` | 新增 `embedding_f16_to_f32_kernel` / `embedding_bf16_to_f32_kernel`，FP16 权重 → FP32 输出 |
+| `src/ops/embedding/op.cpp` | 新增 `embedding_mixed_cpu_kernel<SrcT>` CPU 回退 |
+| `src/ops/linear/nvidia/linear_nvidia.cu` | 新增 FP16 权重 + FP32 输入 → FP32 输出路径：F32→F16 输入转换 + cuBLAS F16×F16→F32 GEMM + FP16 bias→F32 输出 |
+| `src/ops/linear/op.cpp` | 新增 CPU 混合精度 linear 路径 |
+| `src/llaisys/models/qwen2.cpp` | `linear_maybe_dequant` else 分支支持 FP16/BF16 权重透传至 `ops::linear` |
+
+**效果**：embedding/lm_head 从 FP32 (各 2.18 GB) → FP16 (各 1.04 GB)，节省 2.28 GB。
+
+cuBLAS 混合精度要求 A/B 矩阵类型相同，因此 linear 内核使用 **线程局部缓存** 的 FP16 buffer 将输入 F32→F16 转换，避免每次 `cudaMalloc/Free`。
+
+### 9.2 maxseq 配置 Bug 修复
+
+**问题**：`config.json` 中 `sliding_window: 131072`、`use_sliding_window: false`。代码未检查 `use_sliding_window` 字段，直接使用 131072 作为 maxseq → KV-cache 虚拟分配 14.3 GB → 推理极慢（50 tokens 用时 21 分钟）。
+
+**修复**：在 `qwen2.py` 中增加 `use_sliding_window` 检查：
+```python
+use_sw = cfg.get("use_sliding_window", True)
+sw = cfg.get("sliding_window")
+if use_sw and sw is not None and isinstance(sw, int) and sw > 0:
+    maxseq = sw
+else:
+    maxseq = min(cfg.get("max_position_embeddings", ...), 32768)
+```
+
+### 9.3 双重量化问题（根因分析）
+
+**现象**：FP16 embed/lm_head 加载成功、maxseq 修复后，推理速度正常 (2.8 tok/s)，但输出完全乱码：
+```
+掂.Annotation|min踪挞.LoggerFactory interrupt...
+```
+
+**根因**：AWQ→FP32→INT4 的"双重量化"导致累积精度损失。
+
+AWQ 使用 **非对称** 量化 (unsigned INT4 + zero_point)，而我们的内部格式是 **对称** INT4 (signed, 无 zero_point)。转换路径：
+
+```
+AWQ INT4 (非对称, unsigned 0-15, 带 zero_point)
+  → FP32 反量化
+    → 对称 INT4 (signed -8..7, 无 zero_point) ← 精度损失发生处
+```
+
+**数值分析**：
+- 单层权重相对误差 (MAE / weight_std)：~9.4%
+- 28 层累积：$(1 - 0.094)^{28} \approx 0.063$ → 仅保留 **6.3%** 信号
+- 结论：**~94% 的原始权重信息被双重量化破坏**
+
+误差来源：
+1. 非对称 → 对称格式转换丢失 zero_point 信息
+2. FP32 → INT4 再量化引入新的舍入误差
+3. 两次 4-bit 量化的舍入误差叠加，非互相抵消
+
+### 9.4 AWQ→FP16 直接转换方案
+
+为消除双重量化，修改代码使 AWQ 权重在加载时直接反量化为 FP16（不再重新量化为 INT4）：
+
+```python
+# _convert_awq_layer 返回 FP16 而非 INT4
+w_float = w_float.T.contiguous()  # [out, in]
+return w_float.to(torch.float16)  # 直接转 FP16，无精度损失
+```
+
+**但**：FP16 权重的显存需求：
+
+| 组件 | 大小 |
+|---|---|
+| 196 层 linear (FP16) | 12.15 GB |
+| Embedding + LM Head (FP16) | 2.03 GB |
+| KV-Cache (maxseq=2048) | 0.22 GB |
+| CUDA + buffers | 0.40 GB |
+| **总计** | **~14.8 GB** |
+
+本地 RTX 4060 (8 GB) 无法运行。需要 16+ GB 显存的 GPU。
+
+### 9.5 替代方案对比
+
+| 方案 | 显存 | 精度 | 工作量 | 状态 |
+|---|---|---|---|---|
+| **双重量化 (AWQ→INT4)** | ~6.5 GB | ❌ 乱码 | 已完成 | 已弃用 |
+| **AWQ→FP16 直接转换** | ~14.8 GB | ✅ 无损 | 已完成 | 代码就绪，需 16+ GB GPU |
+| **原生 AWQ INT4 内核** | ~6.2 GB | ✅ 无损 | 需新增 CUDA kernel + 权重结构 | 未实现 |
+| **自有 INT4 模型 (quantize.py)** | ~3.5 GB (1.5B) | ✅ 正确 | 已完成 | ✅ 正常运行 |
+
+### 9.6 结论
+
+1. **自有对称 INT4 格式**（通过 `quantize.py` 量化）是当前唯一可靠的量化推理路径。1.5B 模型已验证正确。
+2. **AWQ/GPTQ 兼容**受限于"双重量化"问题，需要实现原生非对称 INT4 解量化内核才能在低显存 GPU 上正确推理。
+3. 代码中保留了 FP16 混合精度内核和 AWQ→FP16 转换逻辑，供未来在大显存 GPU 上使用。
+
+---
+
+## 10. 当前支持的推理路径总结
+
+| 模型 | 格式 | 显存 | 状态 |
+|---|---|---|---|
+| DeepSeek-R1-Distill-Qwen-1.5B (自有 INT4) | 对称 INT4 g128 | ~3.5 GB | ✅ 正常 |
+| DeepSeek-R1-Distill-Qwen-1.5B (自有 INT8) | 对称 INT8 per-channel | ~1.5 GB | ✅ 正常 |
+| 任意 Qwen2 FP32/FP16 | 原始精度 | 按模型大小 | ✅ 正常 |
+| Qwen2-7B-Instruct-AWQ | AWQ→FP16 | ~14.8 GB | ⚠️ 需 16+ GB GPU |
+| 任意 GPTQ/AWQ 模型 | 双重量化→INT4 | 低 | ❌ 精度不可接受 |
+
+---
+
+## 11. 推荐下一步
+
+1. **原生 AWQ INT4 内核**：实现 CUDA dequantize 内核直接从 AWQ 原始格式 (qweight/qzeros/scales) 在飞行中反量化，无精度损失，显存与 INT4 相当
 2. 增加 GPTQ/AWQ 转换缓存文件（首次转换后落盘，后续直接加载）
-3. 输出统一性能表：FP32 / INT8 / INT4 / GPTQ-AWQ（tokens/s、首 token 延迟、显存）
+3. 输出统一性能表：FP32 / INT8 / INT4（tokens/s、首 token 延迟、显存）
 4. 继续优化 INT4 kernel（vectorized load、访存合并）

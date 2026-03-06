@@ -117,12 +117,15 @@ class Qwen2:
         eos_raw = cfg.get("eos_token_id", self._DEFAULT_CONFIG["eos_token_id"])
         end_token = eos_raw[0] if isinstance(eos_raw, list) else int(eos_raw)
 
-        # maxseq：优先用户显式指定 > sliding_window > 上限 max_position_embeddings (截断到 32768 防爆显存)
+        # maxseq：优先用户显式指定 > sliding_window (如果 use_sliding_window != false)
+        #       > 上限 max_position_embeddings (截断到 32768 防爆显存)
         if max_seq_len is not None:
             maxseq = max_seq_len
         else:
+            # 仅在 use_sliding_window 不为 false 时使用 sliding_window
+            use_sw = cfg.get("use_sliding_window", True)  # 默认 True (旧模型没有此字段)
             sw = cfg.get("sliding_window")
-            if sw is not None and isinstance(sw, int) and sw > 0:
+            if use_sw and sw is not None and isinstance(sw, int) and sw > 0:
                 maxseq = sw
             else:
                 maxseq = min(cfg.get("max_position_embeddings",
@@ -259,7 +262,7 @@ class Qwen2:
 
     @staticmethod
     def _convert_awq_layer(qweight, qzeros, scales, bits=4, group_size=128):
-        """Convert one AWQ GEMM format linear layer to our symmetric INT4 format.
+        """Convert one AWQ GEMM format linear layer to FP16 (no double quantization).
 
         AWQ GEMM packing: output dimension is packed.
             qweight: [in_features, out_features // pack_factor] int32
@@ -268,8 +271,7 @@ class Qwen2:
         Groups are along the in_features dimension.
 
         Returns:
-            packed:  [out_features, in_features // 2] uint8 (our format)
-            scale:   [out_features, num_groups] float32 (our format)
+            weight_f16:  [out_features, in_features] float16
         """
         pack_factor = 32 // bits  # 8 for 4-bit
         mask = (1 << bits) - 1    # 0xF
@@ -300,9 +302,9 @@ class Qwen2:
             s_row = scales_f32[g, :].unsqueeze(0)
             w_float[r_start:r_end, :] = (w_slice - z_row) * s_row
 
-        # --- Step 4: Transpose to our [out, in] layout & re-quantize ---
+        # --- Step 4: Transpose to our [out, in] layout & convert to FP16 ---
         w_float = w_float.T.contiguous()  # [out_features, in_features]
-        return Qwen2._requantize_to_int4(w_float, group_size)
+        return w_float.to(torch.float16)
 
     @staticmethod
     def _requantize_to_int4(w_float, group_size):
@@ -467,16 +469,25 @@ class Qwen2:
                     print(f"  WARNING: Missing qzeros/scales for {base}, loading as FP32")
                     continue
 
-                # Convert GPTQ/AWQ → our symmetric INT4
-                packed, our_scale = convert_fn(
-                    qweight, qzeros, scales, bits=bits, group_size=group_size)
-
                 # Map to our weight naming convention
                 weight_name = base + ".weight"
-                scale_name = base + ".weight.scale"
 
-                self._call_load_weight(weight_name, packed, dtype_enum=7)   # U8
-                self._call_load_weight(scale_name, our_scale, dtype_enum=13) # FP32
+                if is_awq:
+                    # AWQ → FP16 dequantized weight (no double quantization)
+                    w_f16 = convert_fn(qweight, qzeros, scales, bits=bits, group_size=group_size)
+                    self._call_load_weight(weight_name, w_f16, dtype_enum=12)  # FP16
+                    vram_mb = w_f16.nelement() * 2 / (1024 * 1024)
+                    tag = "AWQ→FP16"
+                    print(f"  [{tag}] {weight_name}: {list(w_f16.shape)} ({vram_mb:.0f} MB)")
+                else:
+                    # GPTQ → our symmetric INT4
+                    packed, our_scale = convert_fn(
+                        qweight, qzeros, scales, bits=bits, group_size=group_size)
+                    scale_name = base + ".weight.scale"
+                    self._call_load_weight(weight_name, packed, dtype_enum=7)   # U8
+                    self._call_load_weight(scale_name, our_scale, dtype_enum=13) # FP32
+                    tag = "GPTQ→INT4"
+                    print(f"  [{tag}] {weight_name}: {list(packed.shape)} + scale {list(our_scale.shape)}")
 
                 processed.update([name, base + ".qzeros", base + ".scales"])
                 if base + ".g_idx" in all_tensors:
@@ -490,8 +501,6 @@ class Qwen2:
                     processed.add(base + ".bias")
 
                 converted_count += 1
-                tag = "AWQ→INT4" if is_awq else "GPTQ→INT4"
-                print(f"  [{tag}] {weight_name}: {list(packed.shape)} + scale {list(our_scale.shape)}")
 
             elif name.endswith((".qzeros", ".scales", ".g_idx")):
                 # Handled together with .qweight
@@ -499,16 +508,29 @@ class Qwen2:
 
             else:
                 # ─── Regular tensor (embedding, norm, bias, lm_head) ───
-                if tensor.dtype != torch.float32:
-                    tensor = tensor.to(torch.float32)
 
                 # lm_head.weight in GPTQ is sometimes still quantized
                 if name == "lm_head.weight" and "lm_head.qweight" in all_tensors:
                     continue  # handled above
 
-                self._call_load_weight(name, tensor, dtype_enum=13)
-                processed.add(name)
-                print(f"  [KEEP]  {name}: {list(tensor.shape)} → float32")
+                # For large FP-only tensors (embedding, lm_head), keep as FP16
+                # to save significant VRAM (each is [vocab, hidden] ≈ 1 GB saved)
+                # Set _USE_FP16_LARGE = True to enable (requires mixed-precision kernel support)
+                _USE_FP16_LARGE = True
+                _FP16_ELIGIBLE = {"model.embed_tokens.weight", "lm_head.weight"}
+                if _USE_FP16_LARGE and name in _FP16_ELIGIBLE:
+                    if tensor.dtype != torch.float16:
+                        tensor = tensor.to(torch.float16)
+                    self._call_load_weight(name, tensor, dtype_enum=12)  # FP16
+                    processed.add(name)
+                    vram_mb = tensor.nelement() * 2 / (1024 * 1024)
+                    print(f"  [FP16]  {name}: {list(tensor.shape)} → float16 ({vram_mb:.0f} MB)")
+                else:
+                    if tensor.dtype != torch.float32:
+                        tensor = tensor.to(torch.float32)
+                    self._call_load_weight(name, tensor, dtype_enum=13)  # FP32
+                    processed.add(name)
+                    print(f"  [KEEP]  {name}: {list(tensor.shape)} → float32")
 
         print(f"  Converted {converted_count} GPTQ layers to symmetric INT4")
 

@@ -52,6 +52,22 @@ __global__ void add_bias_kernel(T *Y, const T *bias, int64_t M, int64_t N) {
     Y[tid] = from_float<T>(y_val + b_val);
 }
 
+// ---- FP32→FP16 conversion kernel (for mixed-precision linear) ----
+__global__ void convert_f32_to_f16_kernel(__half *out, const float *in, int64_t n) {
+    int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    out[tid] = __float2half(in[tid]);
+}
+
+// ---- FP16 bias add to FP32 output ----
+__global__ void add_bias_f16_to_f32_kernel(float *Y, const __half *bias, int64_t M, int64_t N) {
+    int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = M * N;
+    if (tid >= total) return;
+    int64_t j = tid % N;
+    Y[tid] += __half2float(bias[j]);
+}
+
 // Lazy-initialized thread-local cuBLAS handle
 static cublasHandle_t get_cublas_handle() {
     static thread_local cublasHandle_t handle = nullptr;
@@ -66,7 +82,9 @@ namespace llaisys::ops::nvidia {
 // Y = X * W^T + bias
 // Uses cublasGemmEx to support F32/F16/BF16 with F32 compute.
 void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
-    auto dtype = weight->dtype();
+    auto w_dtype = weight->dtype();
+    auto in_dtype = in->dtype();
+    auto out_dtype = out->dtype();
 
     int64_t M = in->shape()[0];
     int64_t K = in->shape()[1];
@@ -77,8 +95,56 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     float alpha = 1.0f;
     float beta  = 0.0f;
 
+    // ---- Mixed precision path: FP16 weight + FP32 input → FP32 output ----
+    // cuBLAS requires A and B to have the same dtype, so we convert the input
+    // (which is typically small: [1, K]) to FP16 on-the-fly.
+    if (w_dtype == LLAISYS_DTYPE_F16 && in_dtype == LLAISYS_DTYPE_F32 && out_dtype == LLAISYS_DTYPE_F32) {
+        // Use a thread-local cached FP16 buffer to avoid cudaMalloc/Free per call
+        static thread_local __half *in_f16_buf = nullptr;
+        static thread_local int64_t in_f16_cap = 0;
+
+        int64_t in_elems = M * K;
+        if (in_elems > in_f16_cap) {
+            if (in_f16_buf) cudaFree(in_f16_buf);
+            cudaMalloc(&in_f16_buf, in_elems * sizeof(__half));
+            in_f16_cap = in_elems;
+        }
+
+        // Convert input F32 → F16
+        int thr = 256, blk = ((int)in_elems + thr - 1) / thr;
+        convert_f32_to_f16_kernel<<<blk, thr>>>(in_f16_buf, (const float*)in->data(), in_elems);
+
+        // cuBLAS: A=F16 (weight), B=F16 (input_f16), C=F32 (output)
+        CUBLAS_CHECK(cublasGemmEx(handle,
+                                  CUBLAS_OP_T, CUBLAS_OP_N,
+                                  (int)N, (int)M, (int)K,
+                                  &alpha,
+                                  weight->data(), CUDA_R_16F, (int)K,
+                                  in_f16_buf,     CUDA_R_16F, (int)K,
+                                  &beta,
+                                  out->data(),    CUDA_R_32F, (int)N,
+                                  CUBLAS_COMPUTE_32F,
+                                  CUBLAS_GEMM_DEFAULT));
+
+        // Add FP16 bias to FP32 output
+        if (bias && bias->data()) {
+            int64_t total = M * N;
+            thr = 256; blk = ((int)total + thr - 1) / thr;
+            if (bias->dtype() == LLAISYS_DTYPE_F16) {
+                add_bias_f16_to_f32_kernel<<<blk, thr>>>(
+                    (float*)out->data(), (const __half*)bias->data(), M, N);
+            } else {
+                add_bias_kernel<float><<<blk, thr>>>(
+                    (float*)out->data(), (const float*)bias->data(), M, N);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+
+    // ---- Standard path: all tensors have the same dtype ----
     cudaDataType_t cuda_dtype;
-    switch (dtype) {
+    switch (w_dtype) {
     case LLAISYS_DTYPE_F32:  cuda_dtype = CUDA_R_32F;  break;
     case LLAISYS_DTYPE_F16:  cuda_dtype = CUDA_R_16F;  break;
     case LLAISYS_DTYPE_BF16: cuda_dtype = CUDA_R_16BF; break;
@@ -103,7 +169,7 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     if (bias && bias->data()) {
         int64_t total = M * N;
         int thr = 256, blk = ((int)total + thr - 1) / thr;
-        switch (dtype) {
+        switch (w_dtype) {
         case LLAISYS_DTYPE_F32:
             add_bias_kernel<float><<<blk, thr>>>(
                 (float*)out->data(), (const float*)bias->data(), M, N);

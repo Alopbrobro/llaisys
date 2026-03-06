@@ -245,7 +245,9 @@ struct LlaisysQwen2Model {
             ops::dequantize_int4(dq_buf, w, sc, group_size);
             ops::linear(out, in, dq_buf, b);
         } else {
-            // FP32 / FP16 原始路径
+            // FP32 / FP16 / BF16 原始路径
+            // 如果 weight 是 FP16 而 input 是 FP32, ops::linear 内部
+            // 会自动走混合精度路径 (GPU: cuBLAS F16×F16→F32, CPU: cast 累加)
             ops::linear(out, in, w, b);
         }
     }
