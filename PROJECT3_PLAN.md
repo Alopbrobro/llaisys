@@ -2,7 +2,7 @@
 
 > 创建时间: 2026-03-09  
 > 最后更新: 2026-03-10  
-> 状态: Phase A/B/C 已完成，Phase D 待沐曦平台验证
+> 状态: **Phase D 已完成** — 沐曦 C500 全量验证通过 (17/17)
 
 ---
 
@@ -44,39 +44,55 @@
 
 #### MXMACA SDK 关键组件
 
+> **实际验证结果（2026-03-10）：** MACA SDK 安装路径为 `/opt/maca/`（非 `/opt/mxmaca/`），
+> API 命名使用 `mc*` 前缀（非 `maca*`），详见下方对应关系表。
+
 ```
-/opt/mxmaca/
+/opt/maca/                        # 实际 SDK 路径
+├── mxgpu_llvm/bin/
+│   └── mxcc                      # GPU 编译器
 ├── bin/
-│   ├── mxcc          # GPU 编译器（类似 nvcc）
-│   └── mx-smi        # 设备管理工具（类似 nvidia-smi）
+│   └── mx-smi                    # 设备管理工具
 ├── include/
-│   ├── maca_runtime.h       # Runtime API
-│   ├── maca_runtime_api.h   # Runtime API (C 接口)
-│   └── mxblas.h             # BLAS 库头文件
+│   ├── mcr/
+│   │   └── mc_runtime_api.h      # Runtime API 头文件
+│   ├── common/
+│   │   ├── maca_fp16.h           # FP16 数据类型
+│   │   └── maca_bfloat16.h       # BF16 数据类型 (__maca_bfloat16)
+│   ├── mcblas/
+│   │   └── mcblas.h              # BLAS 库头文件
+│   └── mcrand/
+│       └── mcrand_kernel.h       # 随机数生成头文件
 ├── lib/
-│   ├── libmaca_runtime.so   # Runtime 动态库
-│   └── libmxblas.so         # BLAS 动态库
+│   ├── libmcruntime.so           # Runtime 动态库
+│   └── libmcblas.so              # BLAS 动态库
 └── ...
 ```
 
 #### MXMACA Runtime API 与 CUDA 的对应关系
 
-| CUDA API | MXMACA API | 说明 |
-|----------|-----------|------|
-| `cudaMalloc` | `macaMalloc` | 设备端内存分配 |
-| `cudaFree` | `macaFree` | 设备端内存释放 |
-| `cudaMemcpy` | `macaMemcpy` | 同步内存拷贝 |
-| `cudaMemcpyAsync` | `macaMemcpyAsync` | 异步内存拷贝 |
-| `cudaStreamCreate` | `macaStreamCreate` | 创建流 |
-| `cudaStreamDestroy` | `macaStreamDestroy` | 销毁流 |
-| `cudaStreamSynchronize` | `macaStreamSynchronize` | 流同步 |
-| `cudaDeviceSynchronize` | `macaDeviceSynchronize` | 设备同步 |
-| `cudaSetDevice` | `macaSetDevice` | 设置当前设备 |
-| `cudaGetDeviceCount` | `macaGetDeviceCount` | 获取设备数量 |
-| `cudaMemcpyHostToDevice` | `macaMemcpyHostToDevice` | H2D 拷贝类型 |
-| `cudaMemcpyDeviceToHost` | `macaMemcpyDeviceToHost` | D2H 拷贝类型 |
-| `cuBLAS` | `mxBLAS` | BLAS 数学库 |
-| `cublasSgemm` | `mxblasSgemm` | 单精度矩阵乘 |
+> **实际验证（2026-03-10）：** SDK 实际使用 `mc*` 前缀，非文档中假设的 `maca*`。
+
+| CUDA API | MXMACA 文档假设 | **实际 API** | 说明 |
+|----------|----------------|-------------|------|
+| `cudaMalloc` | `macaMalloc` | **`mcMalloc`** | 设备端内存分配 |
+| `cudaFree` | `macaFree` | **`mcFree`** | 设备端内存释放 |
+| `cudaMemcpy` | `macaMemcpy` | **`mcMemcpy`** | 同步内存拷贝 |
+| `cudaMemcpyAsync` | `macaMemcpyAsync` | **`mcMemcpyAsync`** | 异步内存拷贝 |
+| `cudaStreamCreate` | `macaStreamCreate` | **`mcStreamCreate`** | 创建流 |
+| `cudaStreamDestroy` | `macaStreamDestroy` | **`mcStreamDestroy`** | 销毁流 |
+| `cudaStreamSynchronize` | `macaStreamSynchronize` | **`mcStreamSynchronize`** | 流同步 |
+| `cudaDeviceSynchronize` | `macaDeviceSynchronize` | **`mcDeviceSynchronize`** | 设备同步 |
+| `cudaSetDevice` | `macaSetDevice` | **`mcSetDevice`** | 设置当前设备 |
+| `cudaGetDeviceCount` | `macaGetDeviceCount` | **`mcGetDeviceCount`** | 获取设备数量 |
+| `cudaMemcpyHostToDevice` | `macaMemcpyHostToDevice` | **`mcMemcpyHostToDevice`** | H2D 拷贝类型 |
+| `cudaMemcpyDeviceToHost` | `macaMemcpyDeviceToHost` | **`mcMemcpyDeviceToHost`** | D2H 拷贝类型 |
+| `cuBLAS` | `mxBLAS` | **`mcBLAS`** | BLAS 数学库 |
+| `cublasSgemm` | `mxblasSgemm` | **`mcblasSgemm`** | 单精度矩阵乘 |
+| `cublasGemmEx` | — | **`mcblasGemmEx`** | 混合精度 GEMM |
+| `CUDA_R_32F` | — | **`MACA_R_32F`** | 数据类型枚举 |
+| `__nv_bfloat16` | — | **`__maca_bfloat16`** | BF16 数据类型 |
+| `curandStatePhilox4_32_10_t` | — | **`mcrandStatePhilox4_32_10_t`** | 随机数状态 |
 
 #### 编程模型差异
 
@@ -583,6 +599,34 @@ target_end()
 - `test/test_utils.py` 增加 `metax` 设备支持
 - 编译验证通过：`--metax-gpu=true` ✅，`--metax-gpu=true --nv-gpu=true` ✅
 
+### 2026-03-10 — Phase D 沐曦 C500 实机验证完成
+
+**环境发现与 API 修正：**
+- MACA SDK 实际路径 `/opt/maca/`（非 `/opt/mxmaca/`）
+- API 使用 `mc*` 前缀（非 `maca*`）：`mcMalloc`, `mcFree`, `mcMemcpy` 等
+- 头文件在子目录：`mcr/mc_runtime_api.h`, `common/maca_fp16.h`, `mcblas/mcblas.h`
+- BF16 类型：`__maca_bfloat16`（非 `__nv_bfloat16`）
+- GPU 架构目标：`xcore1000`，编译模式：`-x maca`
+
+**源文件修改：**
+- `metax_runtime_api.cpp`：`maca*` → `mc*` API 全部替换
+- 10 个算子文件（`.cu` → `.mc`）：CUDA API → MACA API 替换
+- `ops.h` / `ops.cc` / Python 绑定：新增 `dequantize` / `dequantize_int4` 接口
+- `ops.py`：修复 `linear` 传入 `None` bias 时的 `AttributeError`
+
+**构建系统修改：**
+- `xmake/metax.lua`：使用 `on_build` 自定义编译 `.mc` 文件（避免 xmake CUDA 规则冲突）
+- `xmake.lua`：使用 `add_shflags("--whole-archive")` 解决 archive 链接顺序问题
+- 编译参数：`mxcc --cuda-gpu-arch=xcore1000 -x maca -fPIC -std=c++17 -O2`
+
+**测试结果：17/17 全部通过（三种模型格式）**
+- Level 1 (Runtime API): 6/6 ✅
+- Level 2 (算子): 10/10 ✅
+- Level 3 (端到端推理): 1/1 ✅
+
+**推理性能（DeepSeek-R1-Distill-Qwen-1.5B, MetaX C500）：**
+- FP32: 25.6 tokens/s | INT8: 16.4 tokens/s | INT4: 18.6 tokens/s
+
 ### 2026-03-10 — Phase D 测试脚本与部署脚本就绪
 
 - `scripts/deploy_metax.sh` — 一键部署脚本（6 步自动流程）
@@ -654,8 +698,417 @@ python3 -m server.chat_cli --url http://127.0.0.1:8000
 | 问题 | 排查方法 |
 |------|----------|
 | `mx-smi` 无法识别 GPU | 检查驱动是否安装：`lsmod \| grep maca` |
-| 编译报错找不到 mxcc | 确认 `/opt/mxmaca/bin/mxcc` 存在，或检查 SDK 实际路径 |
-| `libmaca_runtime.so` 找不到 | 设置 `export LD_LIBRARY_PATH=/opt/mxmaca/lib:$LD_LIBRARY_PATH` |
-| `curand_kernel.h` 找不到 | MXMACA SDK 应提供兼容头文件，检查 `/opt/mxmaca/include/` |
+| 编译报错找不到 mxcc | 确认 `/opt/maca/mxgpu_llvm/bin/mxcc` 存在，或检查 `$MACA_PATH` 环境变量 |
+| `libmcruntime.so` 找不到 | 设置 `export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH` |
 | Runtime test 全部 skip | `getDeviceCount` 返回 0，检查驱动和 GPU 状态 |
 | 推理结果全 0 或 NaN | 逐个算子测试定位问题算子 |
+
+---
+
+## 十二、Phase D 实际验证结果（2026-03-10）
+
+### 12.1 验证环境
+
+| 项目 | 实际值 |
+|------|--------|
+| GPU | MetaX C500, 65536 MiB VRAM |
+| 驱动 | 3.0.11 |
+| MACA SDK | 3.0.0.8, 路径 `/opt/maca/` |
+| mxcc 编译器 | v1.0.0, 路径 `/opt/maca/mxgpu_llvm/bin/mxcc` |
+| GPU 架构 | xcore1000 |
+| PyTorch | 2.4.0+metax3.0.0.3 |
+| Python | 3.10.10 |
+| xmake | v3.0.7 |
+
+### 12.2 API 命名差异修正
+
+原计划假设 MACA API 使用 `maca*` 前缀，实际 SDK 使用 `mc*` 前缀。全部修正如下：
+
+| 类别 | 原计划假设 | 实际 API |
+|------|-----------|---------|
+| Runtime | `macaMalloc`, `macaFree` | `mcMalloc`, `mcFree` |
+| 头文件 | `maca_runtime_api.h` | `mc_runtime_api.h`（在 `mcr/` 子目录） |
+| BLAS | `mxblasSgemm` | `mcblasGemmEx`, `mcblasSgemmStridedBatched` |
+| BLAS 枚举 | `MXBLAS_OP_T` | `MCBLAS_OP_T`, `MCBLAS_OP_N` |
+| BLAS 库 | `libmxblas.so` | `libmcblas.so` |
+| Runtime 库 | `libmaca_runtime.so` | `libmcruntime.so` |
+| BF16 类型 | `__nv_bfloat16` | `__maca_bfloat16` |
+| 数据类型 | `CUDA_R_32F` | `MACA_R_32F` |
+| 随机数 | `curandState*` | `mcrandState*` |
+| SDK 路径 | `/opt/mxmaca/` | `/opt/maca/` |
+
+### 12.3 构建系统修改
+
+1. **文件扩展名**：`.cu` → `.mc`（避免 xmake 自动调用 CUDA 工具链）
+2. **自定义编译规则**：`xmake/metax.lua` 使用 `on_build` 手动调用 mxcc 编译 `.mc` 文件
+3. **mxcc 编译参数**：`--cuda-gpu-arch=xcore1000 -x maca -fPIC -std=c++17 -O2`
+4. **链接策略**：使用 `add_shflags("-Wl,--whole-archive", "libllaisys-ops-metax.a", "-Wl,--no-whole-archive")` 解决链接顺序问题
+
+### 12.4 代码变更清单
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `src/device/metax/metax_runtime_api.cpp` | API 重命名 | `maca*` → `mc*` 全部替换 |
+| `src/ops/*/metax/*.mc` (10 个文件) | API 重命名 + 扩展名 | CUDA API → MACA API，`.cu` → `.mc` |
+| `xmake/metax.lua` | 重写 | 自定义 `on_build` 编译规则，正确 SDK 路径 |
+| `xmake.lua` | 修改 | MetaX 链接配置，`add_shflags` 解决 archive 链接 |
+| `include/llaisys/ops.h` | 新增 | `llaisysDequantize`, `llaisysDequantizeInt4` 声明 |
+| `src/llaisys/ops.cc` | 新增 | dequantize C wrapper 实现 |
+| `python/llaisys/ops.py` | 修复+新增 | `linear` None bias 修复，`dequantize` 方法 |
+| `python/llaisys/libllaisys/ops.py` | 新增 | dequantize ctypes 绑定 |
+
+### 12.5 测试结果
+
+**三种模型格式均在 MetaX C500 上通过 17/17 测试：**
+
+| 测试级别 | 测试项 | FP32 | INT8 | INT4 |
+|---------|--------|------|------|------|
+| Level 1 | getDeviceCount | ✅ | ✅ | ✅ |
+| Level 1 | setDevice | ✅ | ✅ | ✅ |
+| Level 1 | malloc_device | ✅ | ✅ | ✅ |
+| Level 1 | malloc_host | ✅ | ✅ | ✅ |
+| Level 1 | memcpy H2D→D2H | ✅ | ✅ | ✅ |
+| Level 1 | free_device/host | ✅ | ✅ | ✅ |
+| Level 2 | add | ✅ | ✅ | ✅ |
+| Level 2 | argmax | ✅ | ✅ | ✅ |
+| Level 2 | embedding | ✅ | ✅ | ✅ |
+| Level 2 | rms_norm | ✅ | ✅ | ✅ |
+| Level 2 | swiglu | ✅ | ✅ | ✅ |
+| Level 2 | rope | ✅ | ✅ | ✅ |
+| Level 2 | linear | ✅ | ✅ | ✅ |
+| Level 2 | dequantize | ✅ | ✅ | ✅ |
+| Level 2 | sample | ✅ | ✅ | ✅ |
+| Level 2 | self_attention | ✅ | ✅ | ✅ |
+| Level 3 | 端到端推理 | ✅ | ✅ | ✅ |
+
+### 12.6 推理性能（DeepSeek-R1-Distill-Qwen-1.5B）
+
+| 模型格式 | 权重大小 | 压缩比 | 吞吐量 (tokens/s) | 输出质量 |
+|---------|---------|--------|-------------------|---------|
+| FP32 原始 | 3.3 GB | 1.0x | **25.6** | 最佳 |
+| INT8 量化 | 2.4 GB | 1.4x | **16.4** | 良好 |
+| INT4 量化 | 0.8 GB | 3.8x | **18.6** | 可接受 |
+
+> 注：吞吐量包含 prefill + decode 阶段，测试 prompt 为 "What is 1+1?"，生成 32 新 tokens。
+
+---
+
+## 十三、沐曦平台操作手册（完整步骤）
+
+> 本章提供从零开始在沐曦 C500 算力平台上编译、测试、部署 llaisys 的完整操作指南。
+> 无需 AI Agent 辅助，按步骤执行即可。
+
+### 13.1 前提条件
+
+- 已租用沐曦 C500 算力实例（推荐 PyTorch 镜像）
+- 已通过 SSH 或 VS Code Remote SSH 连接到实例
+- 项目代码已克隆到实例上
+
+### 13.2 环境检查
+
+```bash
+# 1. 检查 GPU 是否可用
+mx-smi
+# 应看到 "MetaX C500" 设备信息，显示显存 65536 MiB
+
+# 2. 检查 MACA SDK
+ls /opt/maca/mxgpu_llvm/bin/mxcc
+# 应存在 mxcc 编译器
+
+echo $MACA_PATH
+# 应输出 /opt/maca
+
+# 3. 检查 Python 和 PyTorch
+python3 --version                    # 应 >= 3.8
+python3 -c "import torch; print(torch.__version__)"  # 应包含 "metax"
+
+# 4. 检查必要 Python 包
+pip list | grep -E "transformers|safetensors|huggingface"
+# 应有 transformers, safetensors, huggingface_hub
+```
+
+### 13.3 安装 xmake（构建工具）
+
+```bash
+# 安装 xmake（如果尚未安装）
+curl -fsSL https://xmake.io/shget.text | bash
+
+# 激活 xmake（每次新开终端都需要）
+source ~/.xmake/profile
+
+# 验证
+xmake --version
+```
+
+> **注意：** 如果以 root 用户运行，可能需要设置 `export XMAKE_ROOT=y`。
+
+### 13.4 编译 llaisys（MetaX GPU 后端）
+
+```bash
+cd /path/to/llaisys
+
+# 配置构建（启用 MetaX GPU 支持）
+xmake f -c --metax-gpu=true
+
+# 编译（使用所有 CPU 核心）
+xmake -j$(nproc)
+
+# 预期输出：
+# - "compiling.maca src/ops/*/metax/*.mc" 共 10 条
+# - "archiving.release libllaisys-ops-metax.a"
+# - "linking.release libllaisys.so"
+# - "[100%]: build ok"
+
+# 安装共享库
+xmake install
+# 会将 libllaisys.so 复制到 python/llaisys/libllaisys/ 目录
+
+# 安装 Python 包
+pip install ./python/
+```
+
+### 13.5 运行测试
+
+#### 基础测试（不需要模型权重）
+
+```bash
+# Runtime API 测试 — 测试 GPU 内存分配、拷贝、设备管理
+python3 test/test_runtime.py --device metax
+
+# 完整算子测试（Level 1 + Level 2）
+python3 test/test_metax.py
+# 应看到 16/16 通过（Level 3 跳过）
+```
+
+#### 下载模型权重
+
+```bash
+# 方式 1：使用 Python 下载（推荐，自动处理所有文件）
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
+                  local_dir='./models/DeepSeek-R1-Distill-Qwen-1.5B')
+"
+# 约 3.3 GB，需要几分钟
+
+# 方式 2：如果 HuggingFace 被墙，使用镜像
+# export HF_ENDPOINT=https://hf-mirror.com
+# 然后再运行上面的命令
+```
+
+#### 端到端推理测试
+
+```bash
+# 使用 FP32 原始模型（最高精度，约 25 tokens/s）
+python3 test/test_metax.py --model ./models/DeepSeek-R1-Distill-Qwen-1.5B
+
+# 应看到 17/17 全部通过
+```
+
+### 13.6 模型量化（可选，减小显存占用）
+
+```bash
+# INT8 量化（压缩约 1.4x）
+python3 scripts/quantize.py \
+    --model ./models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --output ./models/DeepSeek-R1-Distill-Qwen-1.5B-INT8 \
+    --bits 8
+
+# INT4 量化（压缩约 3.8x，适合显存较小的场景）
+python3 scripts/quantize.py \
+    --model ./models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --output ./models/DeepSeek-R1-Distill-Qwen-1.5B-INT4 \
+    --bits 4
+
+# 量化后测试
+python3 test/test_metax.py --model ./models/DeepSeek-R1-Distill-Qwen-1.5B-INT8
+python3 test/test_metax.py --model ./models/DeepSeek-R1-Distill-Qwen-1.5B-INT4
+```
+
+### 13.7 启动推理服务器
+
+#### 安装服务器依赖
+
+```bash
+pip install uvicorn fastapi sse-starlette
+```
+
+#### 启动服务器
+
+```bash
+cd python
+
+# 使用 FP32 模型（最高精度）
+python3 -m server.app \
+    --model ../models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --device metax \
+    --host 0.0.0.0 \
+    --port 8000
+
+# 或使用 INT8 量化模型（节省显存）
+python3 -m server.app \
+    --model ../models/DeepSeek-R1-Distill-Qwen-1.5B-INT8 \
+    --device metax \
+    --host 0.0.0.0 \
+    --port 8000
+
+# 或使用 INT4 量化模型（最小显存）
+python3 -m server.app \
+    --model ../models/DeepSeek-R1-Distill-Qwen-1.5B-INT4 \
+    --device metax \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+#### 后台运行（关闭终端不影响）
+
+```bash
+cd python
+nohup python3 -m server.app \
+    --model ../models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --device metax \
+    --host 0.0.0.0 \
+    --port 8000 \
+    > ../server.log 2>&1 &
+
+# 查看日志
+tail -f ../server.log
+
+# 停止服务器
+kill $(pgrep -f "server.app")
+```
+
+#### 验证服务器是否正常
+
+```bash
+# 查询可用模型
+curl http://localhost:8000/v1/models
+
+# 发送聊天请求
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-r1-distill-qwen-1.5b",
+    "messages": [{"role": "user", "content": "你好，请介绍一下自己"}],
+    "max_tokens": 100
+  }'
+```
+
+### 13.8 从主机浏览器访问 Web UI
+
+服务器运行在算力平台上，需要将端口映射到本地才能从主机浏览器访问。
+
+#### 方法 1：VS Code 端口转发（推荐，最简单）
+
+如果你通过 **VS Code Remote SSH** 连接到算力平台：
+
+1. VS Code 通常会**自动检测**端口 8000 并提示转发
+2. 如果没有自动检测，手动操作：
+   - 按 `Ctrl+Shift+P`，输入 **"Forward a Port"**
+   - 或在底部面板点击 **"端口 (PORTS)"** 标签页
+   - 输入 `8000`，回车
+3. 在主机浏览器中打开：**http://localhost:8000**
+4. 你会看到一个聊天界面，可以直接与模型对话
+
+#### 方法 2：SSH 端口转发（通用方法）
+
+在你的**本地主机**上打开终端：
+
+```bash
+# 语法：ssh -L 本地端口:远程地址:远程端口 用户@服务器
+ssh -L 8000:localhost:8000 root@<算力平台IP> -p <SSH端口>
+
+# 示例（假设算力平台 SSH 为 123.45.67.89:22222）
+ssh -L 8000:localhost:8000 root@123.45.67.89 -p 22222
+```
+
+然后在浏览器中打开 **http://localhost:8000**。
+
+> **注意：** 保持这个 SSH 连接不要关闭，关闭后端口映射也会断开。
+
+#### 方法 3：算力平台自带端口映射
+
+部分算力平台（如 AutoDL、恒源云等）提供自带的端口映射功能：
+
+1. 登录算力平台控制台
+2. 找到你的实例 → **端口映射** 或 **网络设置**
+3. 添加映射：内部端口 `8000` → 外部端口（平台自动分配）
+4. 平台会提供一个公网地址，如 `http://xxx.platform.com:12345`
+5. 在浏览器中打开该地址即可
+
+### 13.9 使用 CLI 聊天（无需浏览器）
+
+```bash
+cd python
+
+# 确保服务器已在另一个终端运行
+python3 -m server.chat_cli --url http://127.0.0.1:8000
+# 然后直接在终端中输入消息进行对话
+```
+
+### 13.10 使用 OpenAI 兼容 API
+
+服务器提供 OpenAI 兼容的 API，可以用任何支持 OpenAI API 的客户端连接：
+
+```python
+# Python 示例
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="not-needed"  # 本地运行不需要 API key
+)
+
+response = client.chat.completions.create(
+    model="deepseek-r1-distill-qwen-1.5b",
+    messages=[{"role": "user", "content": "你好"}],
+    max_tokens=200
+)
+print(response.choices[0].message.content)
+```
+
+### 13.11 常见问题排查
+
+| 问题 | 解决方法 |
+|------|----------|
+| `mx-smi` 无法识别 GPU | 检查驱动：`lsmod \| grep maca`，联系平台方 |
+| `xmake` 命令找不到 | 执行 `source ~/.xmake/profile` |
+| 编译报 "mxcc not found" | 检查 `/opt/maca/mxgpu_llvm/bin/mxcc` 是否存在 |
+| 链接报 `libmcruntime.so` 找不到 | `export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH` |
+| `import llaisys` 报错 | 确认已执行 `xmake install && pip install ./python/` |
+| 服务器启动后无法访问网页 | 检查端口映射是否设置正确（见 13.8） |
+| 推理结果全 0 或 NaN | 运行 `python3 test/test_metax.py` 逐算子排查 |
+| HuggingFace 下载超时 | 设置 `export HF_ENDPOINT=https://hf-mirror.com` |
+| 重新编译后测试失败 | 重新执行 `xmake install && pip install ./python/` |
+
+### 13.12 完整操作流程速查
+
+```bash
+# ===== 一键部署流程 =====
+cd /path/to/llaisys
+
+# 1. 环境检查
+mx-smi && echo "GPU OK"
+
+# 2. 安装 xmake（仅首次）
+curl -fsSL https://xmake.io/shget.text | bash
+source ~/.xmake/profile
+
+# 3. 编译 + 安装
+xmake f -c --metax-gpu=true
+xmake -j$(nproc)
+xmake install
+pip install ./python/
+
+# 4. 下载模型
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B', local_dir='./models/DeepSeek-R1-Distill-Qwen-1.5B')"
+
+# 5. 验证测试
+python3 test/test_metax.py --model ./models/DeepSeek-R1-Distill-Qwen-1.5B
+
+# 6. 启动服务器
+cd python
+python3 -m server.app --model ../models/DeepSeek-R1-Distill-Qwen-1.5B --device metax --host 0.0.0.0 --port 8000
+
+# 7. 在主机浏览器打开 http://localhost:8000（需端口映射）
+```

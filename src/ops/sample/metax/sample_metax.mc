@@ -3,8 +3,8 @@
 // =============================================================
 #include "sample_metax.hpp"
 
-#include <cuda_runtime.h>
-#include <curand_kernel.h>
+#include <mc_runtime_api.h>
+#include <mcrand_kernel.h>
 #include <cfloat>
 #include <cstdio>
 #include <stdexcept>
@@ -102,9 +102,9 @@ __global__ void sample_kernel(
     }
 
     // 5. Draw random sample using Philox RNG
-    curandStatePhilox4_32_10_t rng;
-    curand_init(seed, 0, 0, &rng);
-    float r = curand_uniform(&rng);
+    mcrandStatePhilox4_32_10_t rng;
+    mcrand_init(seed, 0, 0, &rng);
+    float r = mcrand_uniform(&rng);
 
     float cum = 0.0f;
     int   result = cand_i[0];
@@ -156,7 +156,7 @@ void sample(tensor_t out_idx, tensor_t logits,
         reinterpret_cast<int *>(out_idx->data()),
         reinterpret_cast<float *>(logits->data()),
         vocab_size, stride, inv_temp, top_k, top_p, seed);
-    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(mcGetLastError());
 }
 
 } // namespace llaisys::ops::metax

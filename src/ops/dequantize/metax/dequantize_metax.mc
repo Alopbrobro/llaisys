@@ -3,7 +3,7 @@
 // =============================================================
 #include "dequantize_metax.hpp"
 
-#include <cuda_runtime.h>
+#include <mc_runtime_api.h>
 #include <cstdio>
 #include <stdexcept>
 
@@ -77,7 +77,7 @@ void dequantize(tensor_t out, tensor_t weight, tensor_t scale) {
         reinterpret_cast<const float*>(scale->data()),
         rows, cols);
 
-    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(mcGetLastError());
 }
 
 void dequantize_int4(tensor_t out, tensor_t weight, tensor_t scale, int group_size) {
@@ -96,7 +96,7 @@ void dequantize_int4(tensor_t out, tensor_t weight, tensor_t scale, int group_si
         reinterpret_cast<const float*>(scale->data()),
         rows, cols, packed_cols, num_groups, group_size);
 
-    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(mcGetLastError());
 }
 
 } // namespace llaisys::ops::metax

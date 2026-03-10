@@ -3,9 +3,9 @@
 // =============================================================
 #include "embedding_metax.hpp"
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
+#include <mc_runtime_api.h>
+#include <maca_fp16.h>
+#include <maca_bfloat16.h>
 #include <cstdio>
 #include <stdexcept>
 
@@ -57,7 +57,7 @@ __global__ void embedding_f16_to_f32_kernel(
 }
 
 __global__ void embedding_bf16_to_f32_kernel(
-    float *out, const int64_t *index, const __nv_bfloat16 *weight,
+    float *out, const int64_t *index, const __maca_bfloat16 *weight,
     int64_t num_rows, int64_t embed_dim,
     int64_t w_row_stride, int64_t w_col_stride,
     int64_t o_row_stride, int64_t o_col_stride,
@@ -112,18 +112,18 @@ void embedding(tensor_t out, tensor_t index, tensor_t weight) {
     case LLAISYS_DTYPE_BF16:
         if (out->dtype() == LLAISYS_DTYPE_F32) {
             embedding_bf16_to_f32_kernel<<<blocks, threads>>>(
-                (float *)out->data(), (const int64_t *)index->data(), (const __nv_bfloat16 *)weight->data(),
+                (float *)out->data(), (const int64_t *)index->data(), (const __maca_bfloat16 *)weight->data(),
                 num_rows, embed_dim, w_row_stride, w_col_stride, o_row_stride, o_col_stride, i_stride);
         } else {
-            embedding_kernel<__nv_bfloat16><<<blocks, threads>>>(
-                (__nv_bfloat16 *)out->data(), (const int64_t *)index->data(), (const __nv_bfloat16 *)weight->data(),
+            embedding_kernel<__maca_bfloat16><<<blocks, threads>>>(
+                (__maca_bfloat16 *)out->data(), (const int64_t *)index->data(), (const __maca_bfloat16 *)weight->data(),
                 num_rows, embed_dim, w_row_stride, w_col_stride, o_row_stride, o_col_stride, i_stride);
         }
         break;
     default:
         throw std::runtime_error("MetaX embedding: unsupported dtype");
     }
-    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(mcGetLastError());
 }
 
 } // namespace llaisys::ops::metax

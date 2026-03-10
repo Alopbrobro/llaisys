@@ -663,7 +663,7 @@ def main():
     parser = argparse.ArgumentParser(description="LLAISYS Chat Server")
     parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
                         help="Model path or HuggingFace repo id")
-    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "nvidia"])
+    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "nvidia", "metax"])
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--tp-size", type=int, default=1,

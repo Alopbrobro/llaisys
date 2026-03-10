@@ -14,6 +14,8 @@ __C {
     __export void llaisysSelfAttention(llaisysTensor_t attn_val, llaisysTensor_t q, llaisysTensor_t k, llaisysTensor_t v, float scale);
     __export void llaisysSwiGLU(llaisysTensor_t out, llaisysTensor_t gate, llaisysTensor_t up);
     __export void llaisysSample(llaisysTensor_t out_idx, llaisysTensor_t logits, float temperature, int top_k, float top_p, uint64_t seed);
+    __export void llaisysDequantize(llaisysTensor_t out, llaisysTensor_t weight, llaisysTensor_t scale);
+    __export void llaisysDequantizeInt4(llaisysTensor_t out, llaisysTensor_t weight, llaisysTensor_t scale, int group_size);
 }
 
 #endif

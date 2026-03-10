@@ -3,9 +3,9 @@
 // =============================================================
 #include "swiglu_metax.hpp"
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
+#include <mc_runtime_api.h>
+#include <maca_fp16.h>
+#include <maca_bfloat16.h>
 #include <cstdio>
 #include <stdexcept>
 
@@ -22,12 +22,12 @@
 template<typename T> __device__ inline float to_float(T v);
 template<> __device__ inline float to_float<float>(float v) { return v; }
 template<> __device__ inline float to_float<__half>(__half v) { return __half2float(v); }
-template<> __device__ inline float to_float<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template<> __device__ inline float to_float<__maca_bfloat16>(__maca_bfloat16 v) { return __bfloat162float(v); }
 
 template<typename T> __device__ inline T from_float(float v);
 template<> __device__ inline float from_float<float>(float v) { return v; }
 template<> __device__ inline __half from_float<__half>(float v) { return __float2half(v); }
-template<> __device__ inline __nv_bfloat16 from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+template<> __device__ inline __maca_bfloat16 from_float<__maca_bfloat16>(float v) { return __float2bfloat16(v); }
 
 template<typename T>
 __global__ void swiglu_kernel(
@@ -78,14 +78,14 @@ void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
             seq_len, dim, os0, os1, gs0, gs1, us0, us1);
         break;
     case LLAISYS_DTYPE_BF16:
-        swiglu_kernel<__nv_bfloat16><<<blocks, threads>>>(
-            (__nv_bfloat16 *)out->data(), (const __nv_bfloat16 *)gate->data(), (const __nv_bfloat16 *)up->data(),
+        swiglu_kernel<__maca_bfloat16><<<blocks, threads>>>(
+            (__maca_bfloat16 *)out->data(), (const __maca_bfloat16 *)gate->data(), (const __maca_bfloat16 *)up->data(),
             seq_len, dim, os0, os1, gs0, gs1, us0, us1);
         break;
     default:
         throw std::runtime_error("MetaX swiglu: unsupported dtype");
     }
-    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(mcGetLastError());
 }
 
 } // namespace llaisys::ops::metax

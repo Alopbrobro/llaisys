@@ -17,27 +17,27 @@
 #include <stdexcept>
 
 #ifdef ENABLE_METAX_RUNTIME
-// ---- 真实 MXMACA SDK 路径 (阶段 B 实现) ----
-#include <maca_runtime_api.h>
+// ---- 真实 MACA SDK 路径 ----
+#include <mc_runtime_api.h>
 
 // MACA 错误检查宏
 #define MACA_CHECK(call)                                                           \
     do {                                                                           \
-        macaError_t err = (call);                                                  \
-        if (err != macaSuccess) {                                                  \
+        mcError_t err = (call);                                                    \
+        if (err != mcSuccess) {                                                    \
             fprintf(stderr, "[MACA ERROR] %s (code %d) at %s:%d\n",               \
-                    macaGetErrorString(err), (int)err, __FILE__, __LINE__);        \
-            throw std::runtime_error(macaGetErrorString(err));                     \
+                    mcGetErrorString(err), (int)err, __FILE__, __LINE__);          \
+            throw std::runtime_error(mcGetErrorString(err));                       \
         }                                                                          \
     } while (0)
 
-static macaMemcpyKind toMacaMemcpyKind(llaisysMemcpyKind_t kind) {
+static mcMemcpyKind toMcMemcpyKind(llaisysMemcpyKind_t kind) {
     switch (kind) {
-    case LLAISYS_MEMCPY_H2H: return macaMemcpyHostToHost;
-    case LLAISYS_MEMCPY_H2D: return macaMemcpyHostToDevice;
-    case LLAISYS_MEMCPY_D2H: return macaMemcpyDeviceToHost;
-    case LLAISYS_MEMCPY_D2D: return macaMemcpyDeviceToDevice;
-    default:                 return macaMemcpyDefault;
+    case LLAISYS_MEMCPY_H2H: return mcMemcpyHostToHost;
+    case LLAISYS_MEMCPY_H2D: return mcMemcpyHostToDevice;
+    case LLAISYS_MEMCPY_D2H: return mcMemcpyDeviceToHost;
+    case LLAISYS_MEMCPY_D2D: return mcMemcpyDeviceToDevice;
+    default:                 return mcMemcpyDefault;
     }
 }
 
@@ -46,58 +46,58 @@ namespace runtime_api {
 
 int getDeviceCount() {
     int count = 0;
-    MACA_CHECK(macaGetDeviceCount(&count));
+    MACA_CHECK(mcGetDeviceCount(&count));
     return count;
 }
 
 void setDevice(int device) {
-    MACA_CHECK(macaSetDevice(device));
+    MACA_CHECK(mcSetDevice(device));
 }
 
 void deviceSynchronize() {
-    MACA_CHECK(macaDeviceSynchronize());
+    MACA_CHECK(mcDeviceSynchronize());
 }
 
 llaisysStream_t createStream() {
-    macaStream_t stream = NULL;
-    MACA_CHECK(macaStreamCreate(&stream));
+    mcStream_t stream = NULL;
+    MACA_CHECK(mcStreamCreate(&stream));
     return (llaisysStream_t)stream;
 }
 
 void destroyStream(llaisysStream_t stream) {
-    MACA_CHECK(macaStreamDestroy((macaStream_t)stream));
+    MACA_CHECK(mcStreamDestroy((mcStream_t)stream));
 }
 
 void streamSynchronize(llaisysStream_t stream) {
-    MACA_CHECK(macaStreamSynchronize((macaStream_t)stream));
+    MACA_CHECK(mcStreamSynchronize((mcStream_t)stream));
 }
 
 void *mallocDevice(size_t size) {
     void *ptr = NULL;
-    MACA_CHECK(macaMalloc(&ptr, size));
+    MACA_CHECK(mcMalloc(&ptr, size));
     return ptr;
 }
 
 void freeDevice(void *ptr) {
-    MACA_CHECK(macaFree(ptr));
+    MACA_CHECK(mcFree(ptr));
 }
 
 void *mallocHost(size_t size) {
     void *ptr = NULL;
-    MACA_CHECK(macaMallocHost(&ptr, size));
+    MACA_CHECK(mcMallocHost(&ptr, size));
     return ptr;
 }
 
 void freeHost(void *ptr) {
-    MACA_CHECK(macaFreeHost(ptr));
+    MACA_CHECK(mcFreeHost(ptr));
 }
 
 void memcpySync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t kind) {
-    MACA_CHECK(macaMemcpy(dst, src, size, toMacaMemcpyKind(kind)));
+    MACA_CHECK(mcMemcpy(dst, src, size, toMcMemcpyKind(kind)));
 }
 
 void memcpyAsync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t kind, llaisysStream_t stream) {
-    MACA_CHECK(macaMemcpyAsync(dst, src, size, toMacaMemcpyKind(kind), (macaStream_t)stream));
+    MACA_CHECK(mcMemcpyAsync(dst, src, size, toMcMemcpyKind(kind), (mcStream_t)stream));
 }
 
 } // namespace runtime_api

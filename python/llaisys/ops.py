@@ -29,7 +29,8 @@ class Ops:
     @staticmethod
     def linear(out: Tensor, inp: Tensor, weight: Tensor, bias: Tensor):
         LIB_LLAISYS.llaisysLinear(
-            out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), bias.lib_tensor()
+            out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(),
+            bias.lib_tensor() if bias is not None else None
         )
 
     @staticmethod
@@ -61,3 +62,13 @@ class Ops:
     @staticmethod
     def swiglu(out: Tensor, gate: Tensor, up: Tensor):
         LIB_LLAISYS.llaisysSwiGLU(out.lib_tensor(), gate.lib_tensor(), up.lib_tensor())
+
+    @staticmethod
+    def dequantize(out: Tensor, weight: Tensor, scale: Tensor):
+        LIB_LLAISYS.llaisysDequantize(out.lib_tensor(), weight.lib_tensor(), scale.lib_tensor())
+
+    @staticmethod
+    def dequantize_int4(out: Tensor, weight: Tensor, scale: Tensor, group_size: int):
+        LIB_LLAISYS.llaisysDequantizeInt4(
+            out.lib_tensor(), weight.lib_tensor(), scale.lib_tensor(), c_int(group_size)
+        )

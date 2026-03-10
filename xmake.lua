@@ -150,15 +150,20 @@ target("llaisys")
     end
 
     if has_config("metax-gpu") then
-        -- 在 MetaX 平台上链接 MXMACA 运行时和 mxBLAS
-        if os.isdir("/opt/mxmaca/include") then
-            add_includedirs("/opt/mxmaca/include")
-            add_linkdirs("/opt/mxmaca/lib")
-            add_links("maca_runtime", "mxblas")
-            -- mxcc 编译器兼容 CUDA 语法，编译 .cu 文件
-            add_files("src/device/metax/*.cu|*.cpp")
-            add_files("src/ops/*/metax/*.cu")
+        -- 在 MetaX 平台上链接 MACA 运行时和 mcBLAS
+        local maca_sdk = os.getenv("MACA_PATH") or "/opt/maca"
+        if os.isdir(path.join(maca_sdk, "include")) then
+            add_includedirs(path.join(maca_sdk, "include"))
+            add_includedirs(path.join(maca_sdk, "include/mcr"))
+            add_includedirs(path.join(maca_sdk, "include/common"))
+            add_includedirs(path.join(maca_sdk, "include/mcblas"))
+            add_includedirs(path.join(maca_sdk, "include/mcrand"))
+            add_linkdirs(path.join(maca_sdk, "lib"))
+            add_links("mcruntime", "mcblas")
         end
+        -- 显式链接 MetaX 算子库（on_build 不会自动注册到 xmake 依赖链接）
+        -- 使用 --whole-archive 避免因链接顺序导致符号被丢弃
+        add_shflags("-Wl,--whole-archive", "build/linux/x86_64/release/libllaisys-ops-metax.a", "-Wl,--no-whole-archive", "-lmcblas", "-lmcruntime", {force = true})
     end
 
     set_languages("cxx17")

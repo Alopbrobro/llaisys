@@ -12,17 +12,17 @@
 
 // BLAS 库头文件
 // 在沐曦平台上替换为: #include <mxblas.h>
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
+#include <mcblas.h>
+#include <mc_runtime_api.h>
+#include <maca_fp16.h>
+#include <maca_bfloat16.h>
 #include <cstdio>
 #include <stdexcept>
 
 #define BLAS_CHECK(call)                                                          \
     do {                                                                          \
-        cublasStatus_t status = (call);                                           \
-        if (status != CUBLAS_STATUS_SUCCESS) {                                    \
+        mcblasStatus_t status = (call);                                           \
+        if (status != MCBLAS_STATUS_SUCCESS) {                                    \
             fprintf(stderr, "[MetaX BLAS ERROR] code %d at %s:%d\n",             \
                     (int)status, __FILE__, __LINE__);                             \
             throw std::runtime_error("MetaX BLAS call failed");                   \
@@ -42,12 +42,12 @@
 template<typename T> __device__ inline float to_float(T v);
 template<> __device__ inline float to_float<float>(float v) { return v; }
 template<> __device__ inline float to_float<__half>(__half v) { return __half2float(v); }
-template<> __device__ inline float to_float<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template<> __device__ inline float to_float<__maca_bfloat16>(__maca_bfloat16 v) { return __bfloat162float(v); }
 
 template<typename T> __device__ inline T from_float(float v);
 template<> __device__ inline float from_float<float>(float v) { return v; }
 template<> __device__ inline __half from_float<__half>(float v) { return __float2half(v); }
-template<> __device__ inline __nv_bfloat16 from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+template<> __device__ inline __maca_bfloat16 from_float<__maca_bfloat16>(float v) { return __float2bfloat16(v); }
 
 // ---- Bias add kernel ----
 template<typename T>
@@ -78,11 +78,11 @@ __global__ void add_bias_f16_to_f32_kernel(float *Y, const __half *bias, int64_t
 }
 
 // Lazy-initialized thread-local BLAS handle
-// 注：在沐曦平台上 cublasHandle_t → mxblasHandle_t, cublasCreate → mxblasCreate
-static cublasHandle_t get_blas_handle() {
-    static thread_local cublasHandle_t handle = nullptr;
+// 注：在沐曦平台上 mcblasHandle_t → mxblasHandle_t, mcblasCreate → mxblasCreate
+static mcblasHandle_t get_blas_handle() {
+    static thread_local mcblasHandle_t handle = nullptr;
     if (!handle) {
-        BLAS_CHECK(cublasCreate(&handle));
+        BLAS_CHECK(mcblasCreate(&handle));
     }
     return handle;
 }
@@ -98,7 +98,7 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     int64_t K = in->shape()[1];
     int64_t N = weight->shape()[0];
 
-    cublasHandle_t handle = get_blas_handle();
+    mcblasHandle_t handle = get_blas_handle();
 
     float alpha = 1.0f;
     float beta  = 0.0f;
@@ -110,24 +110,24 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
 
         int64_t in_elems = M * K;
         if (in_elems > in_f16_cap) {
-            if (in_f16_buf) cudaFree(in_f16_buf);
-            cudaMalloc(&in_f16_buf, in_elems * sizeof(__half));
+            if (in_f16_buf) mcFree(in_f16_buf);
+            mcMalloc(&in_f16_buf, in_elems * sizeof(__half));
             in_f16_cap = in_elems;
         }
 
         int thr = 256, blk = ((int)in_elems + thr - 1) / thr;
         convert_f32_to_f16_kernel<<<blk, thr>>>(in_f16_buf, (const float*)in->data(), in_elems);
 
-        BLAS_CHECK(cublasGemmEx(handle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
+        BLAS_CHECK(mcblasGemmEx(handle,
+                                MCBLAS_OP_T, MCBLAS_OP_N,
                                 (int)N, (int)M, (int)K,
                                 &alpha,
-                                weight->data(), CUDA_R_16F, (int)K,
-                                in_f16_buf,     CUDA_R_16F, (int)K,
+                                weight->data(), MACA_R_16F, (int)K,
+                                in_f16_buf,     MACA_R_16F, (int)K,
                                 &beta,
-                                out->data(),    CUDA_R_32F, (int)N,
-                                CUBLAS_COMPUTE_32F,
-                                CUBLAS_GEMM_DEFAULT));
+                                out->data(),    MACA_R_32F, (int)N,
+                                MCBLAS_COMPUTE_32F,
+                                MCBLAS_GEMM_DEFAULT));
 
         if (bias && bias->data()) {
             int64_t total = M * N;
@@ -139,31 +139,31 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
                 add_bias_kernel<float><<<blk, thr>>>(
                     (float*)out->data(), (const float*)bias->data(), M, N);
             }
-            GPU_CHECK(cudaGetLastError());
+            GPU_CHECK(mcGetLastError());
         }
         return;
     }
 
     // ---- Standard path ----
-    cudaDataType_t cuda_dtype;
+    macaDataType_t maca_dtype;
     switch (w_dtype) {
-    case LLAISYS_DTYPE_F32:  cuda_dtype = CUDA_R_32F;  break;
-    case LLAISYS_DTYPE_F16:  cuda_dtype = CUDA_R_16F;  break;
-    case LLAISYS_DTYPE_BF16: cuda_dtype = CUDA_R_16BF; break;
+    case LLAISYS_DTYPE_F32:  maca_dtype = MACA_R_32F;  break;
+    case LLAISYS_DTYPE_F16:  maca_dtype = MACA_R_16F;  break;
+    case LLAISYS_DTYPE_BF16: maca_dtype = MACA_R_16BF; break;
     default:
         throw std::runtime_error("MetaX linear: unsupported dtype");
     }
 
-    BLAS_CHECK(cublasGemmEx(handle,
-                            CUBLAS_OP_T, CUBLAS_OP_N,
+    BLAS_CHECK(mcblasGemmEx(handle,
+                            MCBLAS_OP_T, MCBLAS_OP_N,
                             (int)N, (int)M, (int)K,
                             &alpha,
-                            weight->data(), cuda_dtype, (int)K,
-                            in->data(),     cuda_dtype, (int)K,
+                            weight->data(), maca_dtype, (int)K,
+                            in->data(),     maca_dtype, (int)K,
                             &beta,
-                            out->data(),    cuda_dtype, (int)N,
-                            CUBLAS_COMPUTE_32F,
-                            CUBLAS_GEMM_DEFAULT));
+                            out->data(),    maca_dtype, (int)N,
+                            MCBLAS_COMPUTE_32F,
+                            MCBLAS_GEMM_DEFAULT));
 
     if (bias && bias->data()) {
         int64_t total = M * N;
@@ -178,12 +178,12 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
                 (__half*)out->data(), (const __half*)bias->data(), M, N);
             break;
         case LLAISYS_DTYPE_BF16:
-            add_bias_kernel<__nv_bfloat16><<<blk, thr>>>(
-                (__nv_bfloat16*)out->data(), (const __nv_bfloat16*)bias->data(), M, N);
+            add_bias_kernel<__maca_bfloat16><<<blk, thr>>>(
+                (__maca_bfloat16*)out->data(), (const __maca_bfloat16*)bias->data(), M, N);
             break;
         default: break;
         }
-        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(mcGetLastError());
     }
 }
 

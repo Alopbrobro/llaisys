@@ -3,10 +3,10 @@
 // =============================================================
 #include "self_attention_metax.hpp"
 
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
+#include <mcblas.h>
+#include <mc_runtime_api.h>
+#include <maca_fp16.h>
+#include <maca_bfloat16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -27,7 +27,7 @@
 #define BLAS_CHECK(call)                                                          \
     do {                                                                          \
         auto status = (call);                                                     \
-        if (status != CUBLAS_STATUS_SUCCESS) {                                    \
+        if (status != MCBLAS_STATUS_SUCCESS) {                                    \
             fprintf(stderr, "[MetaX BLAS ERROR] code %d at %s:%d\n",             \
                     (int)status, __FILE__, __LINE__);                             \
             throw std::runtime_error("MetaX BLAS call failed");                   \
@@ -38,12 +38,12 @@
 template<typename T> __device__ inline float to_float(T v);
 template<> __device__ inline float to_float<float>(float v) { return v; }
 template<> __device__ inline float to_float<__half>(__half v) { return __half2float(v); }
-template<> __device__ inline float to_float<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template<> __device__ inline float to_float<__maca_bfloat16>(__maca_bfloat16 v) { return __bfloat162float(v); }
 
 template<typename T> __device__ inline T from_float(float v);
 template<> __device__ inline float from_float<float>(float v) { return v; }
 template<> __device__ inline __half from_float<__half>(float v) { return __float2half(v); }
-template<> __device__ inline __nv_bfloat16 from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+template<> __device__ inline __maca_bfloat16 from_float<__maca_bfloat16>(float v) { return __float2bfloat16(v); }
 
 // ----------------------------------------------------------------
 // Gather ALL Q heads into contiguous float buffer
@@ -190,10 +190,10 @@ __global__ void softmax_row_kernel(float *data, int64_t num_rows, int64_t row_le
 // ----------------------------------------------------------------
 // Lazy-initialized thread-local cuBLAS / mxBLAS handle
 // ----------------------------------------------------------------
-static cublasHandle_t get_blas_handle() {
-    static thread_local cublasHandle_t handle = nullptr;
+static mcblasHandle_t get_blas_handle() {
+    static thread_local mcblasHandle_t handle = nullptr;
     if (!handle) {
-        BLAS_CHECK(cublasCreate(&handle));
+        BLAS_CHECK(mcblasCreate(&handle));
     }
     return handle;
 }
@@ -214,14 +214,14 @@ static size_t s_o_all_sz = 0;
 
 static void ensure_buf(float *&ptr, size_t &cur, size_t need) {
     if (need <= cur) return;
-    if (ptr) cudaFree(ptr);
-    GPU_CHECK(cudaMalloc(&ptr, need));
+    if (ptr) mcFree(ptr);
+    GPU_CHECK(mcMalloc(&ptr, need));
     cur = need;
 }
 
 // ----------------------------------------------------------------
 // Batched self-attention: all heads computed in parallel via
-// cublasSgemmStridedBatched (mxBLAS on MetaX).
+// mcblasSgemmStridedBatched (mxBLAS on MetaX).
 // ----------------------------------------------------------------
 namespace llaisys::ops::metax {
 
@@ -245,7 +245,7 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
     ptrdiff_t v_s0 = v->strides()[0], v_s1 = v->strides()[1], v_s2 = v->strides()[2];
     ptrdiff_t o_s0 = attn_val->strides()[0], o_s1 = attn_val->strides()[1], o_s2 = attn_val->strides()[2];
 
-    cublasHandle_t handle = get_blas_handle();
+    mcblasHandle_t handle = get_blas_handle();
 
     // Ensure cached temp buffers
     size_t q_need = (size_t)(n_head * seq_len * head_dim) * sizeof(float);
@@ -268,7 +268,7 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
         int blk = ((int)n + thr - 1) / thr;
         gather_all_q_kernel<T><<<blk, thr>>>(
             s_q_all, q_ptr, seq_len, n_head, head_dim, q_s0, q_s1, q_s2);
-        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(mcGetLastError());
     }
 
     // 2. Gather + expand KV: T -> float [n_head, total_len, dim]
@@ -278,7 +278,7 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
         gather_expand_kv_kernel<T><<<blk, thr>>>(
             s_k_all, k_ptr, total_len, n_head, n_kv_head, head_dim, group_size,
             k_s0, k_s1, k_s2);
-        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(mcGetLastError());
     }
     {
         int64_t n = n_head * total_len * v_dim;
@@ -286,7 +286,7 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
         gather_expand_kv_kernel<T><<<blk, thr>>>(
             s_v_all, v_ptr, total_len, n_head, n_kv_head, v_dim, group_size,
             v_s0, v_s1, v_s2);
-        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(mcGetLastError());
     }
 
     // 3. Batched GEMM: scores[h] = Q[h] * K[h]^T for all heads
@@ -295,8 +295,8 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
         long long strideA = (long long)(total_len * head_dim);
         long long strideB = (long long)(seq_len * head_dim);
         long long strideC = (long long)(seq_len * total_len);
-        BLAS_CHECK(cublasSgemmStridedBatched(handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
+        BLAS_CHECK(mcblasSgemmStridedBatched(handle,
+            MCBLAS_OP_T, MCBLAS_OP_N,
             (int)total_len, (int)seq_len, (int)head_dim,
             &alpha,
             s_k_all, (int)head_dim, strideA,
@@ -311,9 +311,9 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
         int64_t ns = n_head * seq_len * total_len;
         int blk = ((int)ns + thr - 1) / thr;
         scale_kernel<<<blk, thr>>>(s_scores, scale, ns);
-        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(mcGetLastError());
         causal_mask_batched_kernel<<<blk, thr>>>(s_scores, n_head, seq_len, total_len);
-        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(mcGetLastError());
     }
 
     // 5. Softmax per row (n_head * seq_len rows)
@@ -323,7 +323,7 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
         while (sthr < total_len && sthr < 1024) sthr <<= 1;
         size_t smem = sthr * sizeof(float);
         softmax_row_kernel<<<(int)num_rows, sthr, smem>>>(s_scores, num_rows, total_len);
-        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(mcGetLastError());
     }
 
     // 6. Batched GEMM: O[h] = probs[h] * V[h] for all heads
@@ -332,8 +332,8 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
         long long strideA = (long long)(total_len * v_dim);
         long long strideB = (long long)(seq_len * total_len);
         long long strideC = (long long)(seq_len * v_dim);
-        BLAS_CHECK(cublasSgemmStridedBatched(handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
+        BLAS_CHECK(mcblasSgemmStridedBatched(handle,
+            MCBLAS_OP_N, MCBLAS_OP_N,
             (int)v_dim, (int)seq_len, (int)total_len,
             &alpha,
             s_v_all, (int)v_dim, strideA,
@@ -349,7 +349,7 @@ static void self_attention_impl(tensor_t attn_val, tensor_t q, tensor_t k, tenso
         int blk = ((int)n + thr - 1) / thr;
         scatter_all_heads_kernel<T><<<blk, thr>>>(
             o_ptr, s_o_all, seq_len, n_head, v_dim, o_s0, o_s1, o_s2);
-        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(mcGetLastError());
     }
 }
 
@@ -363,7 +363,7 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
         self_attention_impl<__half>(attn_val, q, k, v, scale);
         break;
     case LLAISYS_DTYPE_BF16:
-        self_attention_impl<__nv_bfloat16>(attn_val, q, k, v, scale);
+        self_attention_impl<__maca_bfloat16>(attn_val, q, k, v, scale);
         break;
     default:
         throw std::runtime_error("MetaX self_attention: unsupported dtype");

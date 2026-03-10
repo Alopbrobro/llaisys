@@ -45,3 +45,9 @@ def load_ops(lib):
         ctypes.c_uint64,  # seed
     ]
     lib.llaisysSample.restype = None
+
+    lib.llaisysDequantize.argtypes = [llaisysTensor_t, llaisysTensor_t, llaisysTensor_t]
+    lib.llaisysDequantize.restype = None
+
+    lib.llaisysDequantizeInt4.argtypes = [llaisysTensor_t, llaisysTensor_t, llaisysTensor_t, ctypes.c_int]
+    lib.llaisysDequantizeInt4.restype = None
