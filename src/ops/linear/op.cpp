@@ -4,6 +4,10 @@
 #include "nvidia/linear_nvidia.cuh"
 #endif
 
+#ifdef ENABLE_METAX_API
+#include "metax/linear_metax.hpp"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void linear_cpu_kernel(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) { // Y = XW^T + offset
@@ -64,6 +68,12 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
 #ifdef ENABLE_NVIDIA_API
     if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::linear(out, in, weight, bias);
+    }
+#endif
+
+#ifdef ENABLE_METAX_API
+    if (out->deviceType() == LLAISYS_DEVICE_METAX) {
+        return metax::linear(out, in, weight, bias);
     }
 #endif
 

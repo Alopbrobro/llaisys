@@ -4,6 +4,10 @@
 #include "nvidia/dequantize_nvidia.cuh"
 #endif
 
+#ifdef ENABLE_METAX_API
+#include "metax/dequantize_metax.hpp"
+#endif
+
 #include <stdexcept>
 
 namespace llaisys::ops {
@@ -39,6 +43,12 @@ void dequantize(tensor_t out, tensor_t weight, tensor_t scale) {
 #ifdef ENABLE_NVIDIA_API
     if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::dequantize(out, weight, scale);
+    }
+#endif
+
+#ifdef ENABLE_METAX_API
+    if (out->deviceType() == LLAISYS_DEVICE_METAX) {
+        return metax::dequantize(out, weight, scale);
     }
 #endif
 
@@ -91,6 +101,12 @@ void dequantize_int4(tensor_t out, tensor_t weight, tensor_t scale, int group_si
 #ifdef ENABLE_NVIDIA_API
     if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::dequantize_int4(out, weight, scale, group_size);
+    }
+#endif
+
+#ifdef ENABLE_METAX_API
+    if (out->deviceType() == LLAISYS_DEVICE_METAX) {
+        return metax::dequantize_int4(out, weight, scale, group_size);
     }
 #endif
 

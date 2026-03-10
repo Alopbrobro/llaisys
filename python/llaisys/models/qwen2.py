@@ -25,6 +25,32 @@ from ..libllaisys.qwen2 import (
     pool_insert,
     pool_lookup,
     pool_clear,
+    # Phase 5 (项目#4): 批量推理 API
+    batch_context_create,
+    batch_context_destroy,
+    batch_slot_reset,
+    batch_prefill,
+    batch_decode,
+    batch_slot_get_pos,
+    batch_slot_save,
+    batch_slot_restore,
+    # Phase 5 (项目#5): 张量并行
+    model_create_tp,
+    model_get_tp_size,
+    model_get_tp_rank,
+    model_set_comm,
+)
+
+# 分布式通信
+from ..libllaisys.distributed import (
+    DistBackend,
+    LlaisysDistConfig,
+    comm_create,
+    comm_destroy,
+    comm_backend,
+    comm_world_size,
+    comm_rank,
+    backend_available,
 )
 
 from pathlib import Path
@@ -98,7 +124,21 @@ class Qwen2:
     }
 
     def __init__(self, model_path, device: DeviceType = DeviceType.CPU,
-                 max_seq_len: int | None = None):
+                 max_seq_len: int | None = None,
+                 tp_size: int = 1, tp_rank: int = 0,
+                 dist_backend: DistBackend | None = None,
+                 comm_handle=None):
+        """创建 Qwen2 模型实例.
+
+        Args:
+            model_path: 模型权重目录路径.
+            device: 设备类型 (CPU / NVIDIA).
+            max_seq_len: 最大序列长度 (None 则从 config.json 推导).
+            tp_size: 张量并行度 (默认 1 = 单卡).
+            tp_rank: 当前进程的 TP rank (0-based).
+            dist_backend: 分布式后端 (None 则在 tp_size>1 时自动选 NCCL, 否则不创建).
+            comm_handle: 外部已创建的 comm 句柄 (覆盖自动创建).
+        """
         model_path = Path(model_path)
 
         # ─── 从 config.json 读取架构参数 ───
@@ -156,7 +196,49 @@ class Qwen2:
         meta.end_token = end_token
 
         print("Creating Qwen2 Model instance...")
-        self.model_handle = model_create(ctypes.byref(meta), device.value, None, 0)
+        self._tp_size = tp_size
+        self._tp_rank = tp_rank
+        self._comm_handle = None   # 分布式通信句柄
+        self._owns_comm = False    # 是否由本实例创建 (析构时需销毁)
+
+        if tp_size > 1:
+            # TP 模式: 使用 CreateTP
+            device_id = tp_rank  # 默认每个 rank 对应一张卡
+            self.model_handle = model_create_tp(
+                ctypes.byref(meta), device.value, device_id, tp_size, tp_rank)
+
+            # 创建或绑定通信句柄
+            if comm_handle is not None:
+                self._comm_handle = comm_handle
+                self._owns_comm = False
+            elif dist_backend is not None:
+                cfg = LlaisysDistConfig()
+                cfg.backend = int(dist_backend)
+                cfg.world_size = tp_size
+                cfg.rank = tp_rank
+                cfg.local_device = device_id
+                self._comm_handle = comm_create(cfg)
+                self._owns_comm = True
+            else:
+                # tp_size>1 但没指定后端 → 自动用 NCCL (若可用), 否则 MOCK
+                if backend_available(int(DistBackend.NCCL)):
+                    auto_backend = DistBackend.NCCL
+                else:
+                    auto_backend = DistBackend.MOCK
+                    print(f"[Qwen2] WARNING: NCCL not available, using MOCK backend for TP")
+                cfg = LlaisysDistConfig()
+                cfg.backend = int(auto_backend)
+                cfg.world_size = tp_size
+                cfg.rank = tp_rank
+                cfg.local_device = device_id
+                self._comm_handle = comm_create(cfg)
+                self._owns_comm = True
+
+            # 绑定到模型
+            model_set_comm(self.model_handle, self._comm_handle)
+            print(f"[Qwen2] TP mode: tp_size={tp_size}, tp_rank={tp_rank}")
+        else:
+            self.model_handle = model_create(ctypes.byref(meta), device.value, None, 0)
 
         # 保存配置供后续使用
         self._config = cfg
@@ -641,10 +723,34 @@ class Qwen2:
     def __del__(self):
         if hasattr(self, 'model_handle') and self.model_handle:
             model_destroy(self.model_handle)
+            self.model_handle = None
+        # 清理 comm (仅当由本实例创建时)
+        if hasattr(self, '_comm_handle') and self._comm_handle and self._owns_comm:
+            comm_destroy(self._comm_handle)
+            self._comm_handle = None
 
     def reset_cache(self):
         """Reset the KV-cache position without reloading weights."""
         model_reset_cache(self.model_handle)
+
+    # ==========================================
+    # 张量并行 (TP) 属性
+    # ==========================================
+
+    @property
+    def tp_size(self) -> int:
+        """返回当前 TP 并行度."""
+        return self._tp_size
+
+    @property
+    def tp_rank(self) -> int:
+        """返回当前 TP rank."""
+        return self._tp_rank
+
+    @property
+    def is_tp(self) -> bool:
+        """是否处于 TP 模式 (tp_size > 1)."""
+        return self._tp_size > 1
 
     # ==========================================
     # Phase 4: KV-Cache 高级接口
@@ -751,3 +857,163 @@ class Qwen2:
         """清空前缀树池."""
         if pool_handle:
             pool_clear(pool_handle)
+
+    # ==========================================
+    # Phase 5 (项目#4): 批量推理 API
+    # ==========================================
+
+    def create_batch_context(self, max_batch_size: int = 8, max_seq_per_slot: int = 2048):
+        """创建批量推理上下文 (预分配 max_batch_size 个 KV-Cache slot).
+        
+        Args:
+            max_batch_size: 最大并发请求数.
+            max_seq_per_slot: 每个 slot 的 KV-Cache 最大序列长度.
+        
+        Returns:
+            BatchContext 对象.
+        """
+        return BatchContext(self, max_batch_size, max_seq_per_slot)
+
+
+class BatchContext:
+    """批量推理上下文: 管理多个 KV-Cache slot, 支持批量 decode.
+    
+    Usage:
+        ctx = model.create_batch_context(max_batch_size=8)
+        
+        # Prefill slot 0
+        first_tok = ctx.prefill(slot_id=0, token_ids=[...], temperature=0.8)
+        
+        # Batch decode
+        next_tokens = ctx.decode(
+            active_slots=[0, 1, 2],
+            current_tokens=[tok0, tok1, tok2],
+            temperature=0.8
+        )
+        
+        # Save/restore slot cache
+        snapshot = ctx.slot_save(0)
+        ctx.slot_restore(1, snapshot)
+    """
+
+    def __init__(self, model: Qwen2, max_batch_size: int = 8, max_seq_per_slot: int = 2048):
+        self.model = model
+        self.max_batch_size = max_batch_size
+        self.max_seq_per_slot = max_seq_per_slot
+        self._handle = batch_context_create(
+            model.model_handle,
+            ctypes.c_size_t(max_batch_size),
+            ctypes.c_size_t(max_seq_per_slot),
+        )
+        if not self._handle:
+            raise RuntimeError("Failed to create batch context")
+        self._end_token = model._end_token
+
+    def __del__(self):
+        if hasattr(self, '_handle') and self._handle:
+            batch_context_destroy(self._handle)
+            self._handle = None
+
+    def slot_reset(self, slot_id: int):
+        """重置指定 slot 的 KV-Cache."""
+        batch_slot_reset(self._handle, ctypes.c_size_t(slot_id))
+
+    def prefill(
+        self,
+        slot_id: int,
+        token_ids: Sequence[int],
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.9,
+    ) -> int:
+        """在指定 slot 上执行 prefill, 返回首个生成 token.
+        
+        Args:
+            slot_id: slot 索引 (0 ~ max_batch_size-1).
+            token_ids: 完整 prompt 的 token ID 序列.
+            temperature: 采样温度.
+            top_k: Top-K 采样.
+            top_p: Top-P 采样.
+            
+        Returns:
+            int: 首个生成的 token ID.
+        """
+        token_np = np.array(token_ids, dtype=np.int64)
+        if not token_np.flags['C_CONTIGUOUS']:
+            token_np = np.ascontiguousarray(token_np)
+        token_ptr = token_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+        
+        result = batch_prefill(
+            self._handle,
+            ctypes.c_size_t(slot_id),
+            token_ptr,
+            ctypes.c_size_t(len(token_ids)),
+            ctypes.c_float(temperature),
+            ctypes.c_int(top_k),
+            ctypes.c_float(top_p),
+        )
+        return int(result)
+
+    def decode(
+        self,
+        active_slots: Sequence[int],
+        current_tokens: Sequence[int],
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.9,
+    ) -> list[int]:
+        """对活跃 slots 执行一步批量 decode.
+        
+        Args:
+            active_slots: 活跃 slot ID 列表.
+            current_tokens: 各 slot 当前 token 列表 (与 active_slots 一一对应).
+            temperature: 采样温度.
+            top_k: Top-K 采样.
+            top_p: Top-P 采样.
+            
+        Returns:
+            list[int]: 各 slot 的 next token 列表.
+        """
+        num_active = len(active_slots)
+        assert len(current_tokens) == num_active, "active_slots and current_tokens must have same length"
+        
+        slots_arr = (ctypes.c_size_t * num_active)(*active_slots)
+        tokens_arr = (ctypes.c_int64 * num_active)(*current_tokens)
+        output_arr = (ctypes.c_int64 * num_active)()
+        
+        batch_decode(
+            self._handle,
+            slots_arr,
+            ctypes.c_size_t(num_active),
+            tokens_arr,
+            ctypes.c_float(temperature),
+            ctypes.c_int(top_k),
+            ctypes.c_float(top_p),
+            output_arr,
+        )
+        
+        return [int(output_arr[i]) for i in range(num_active)]
+
+    def slot_get_pos(self, slot_id: int) -> int:
+        """获取 slot 的当前 KV-Cache 位置."""
+        return int(batch_slot_get_pos(self._handle, ctypes.c_size_t(slot_id)))
+
+    def slot_save(self, slot_id: int):
+        """保存 slot 的 KV-Cache 快照.
+        
+        Returns:
+            snapshot handle (C++ 指针), 如果 slot 为空则返回 None.
+        """
+        handle = batch_slot_save(self._handle, ctypes.c_size_t(slot_id))
+        if not handle:
+            return None
+        return handle
+
+    def slot_restore(self, slot_id: int, snapshot_handle):
+        """从快照恢复 slot 的 KV-Cache."""
+        if snapshot_handle:
+            batch_slot_restore(
+                self._handle,
+                ctypes.c_size_t(slot_id),
+                snapshot_handle,
+            )

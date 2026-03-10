@@ -139,6 +139,101 @@ def _setup_functions():
         lib.llaisysKVCachePoolClear.argtypes = [ctypes.c_void_p]
         lib.llaisysKVCachePoolClear.restype = None
 
+    # ── Phase 5 (项目#4): 批量推理 API ──
+
+    # BatchContextCreate
+    if hasattr(lib, 'llaisysQwen2BatchContextCreate'):
+        lib.llaisysQwen2BatchContextCreate.argtypes = [
+            ctypes.c_void_p,  # model
+            ctypes.c_size_t,  # max_batch_size
+            ctypes.c_size_t,  # max_seq_per_slot
+        ]
+        lib.llaisysQwen2BatchContextCreate.restype = ctypes.c_void_p
+
+    # BatchContextDestroy
+    if hasattr(lib, 'llaisysQwen2BatchContextDestroy'):
+        lib.llaisysQwen2BatchContextDestroy.argtypes = [ctypes.c_void_p]
+        lib.llaisysQwen2BatchContextDestroy.restype = None
+
+    # BatchSlotReset
+    if hasattr(lib, 'llaisysQwen2BatchSlotReset'):
+        lib.llaisysQwen2BatchSlotReset.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        lib.llaisysQwen2BatchSlotReset.restype = None
+
+    # BatchPrefill
+    if hasattr(lib, 'llaisysQwen2BatchPrefill'):
+        lib.llaisysQwen2BatchPrefill.argtypes = [
+            ctypes.c_void_p,                # ctx
+            ctypes.c_size_t,                # slot_id
+            ctypes.POINTER(ctypes.c_int64), # token_ids
+            ctypes.c_size_t,                # ntoken
+            ctypes.c_float,                 # temperature
+            ctypes.c_int,                   # top_k
+            ctypes.c_float,                 # top_p
+        ]
+        lib.llaisysQwen2BatchPrefill.restype = ctypes.c_int64
+
+    # BatchDecode
+    if hasattr(lib, 'llaisysQwen2BatchDecode'):
+        lib.llaisysQwen2BatchDecode.argtypes = [
+            ctypes.c_void_p,                 # ctx
+            ctypes.POINTER(ctypes.c_size_t), # active_slots
+            ctypes.c_size_t,                 # num_active
+            ctypes.POINTER(ctypes.c_int64),  # current_tokens
+            ctypes.c_float,                  # temperature
+            ctypes.c_int,                    # top_k
+            ctypes.c_float,                  # top_p
+            ctypes.POINTER(ctypes.c_int64),  # output_tokens
+        ]
+        lib.llaisysQwen2BatchDecode.restype = None
+
+    # BatchSlotGetPos
+    if hasattr(lib, 'llaisysQwen2BatchSlotGetPos'):
+        lib.llaisysQwen2BatchSlotGetPos.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        lib.llaisysQwen2BatchSlotGetPos.restype = ctypes.c_int64
+
+    # BatchSlotSave
+    if hasattr(lib, 'llaisysQwen2BatchSlotSave'):
+        lib.llaisysQwen2BatchSlotSave.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        lib.llaisysQwen2BatchSlotSave.restype = ctypes.c_void_p
+
+    # BatchSlotRestore
+    if hasattr(lib, 'llaisysQwen2BatchSlotRestore'):
+        lib.llaisysQwen2BatchSlotRestore.argtypes = [
+            ctypes.c_void_p,  # ctx
+            ctypes.c_size_t,  # slot_id
+            ctypes.c_void_p,  # snapshot
+        ]
+        lib.llaisysQwen2BatchSlotRestore.restype = None
+
+    # ── Phase 5 (项目#5): 分布式推理 / 张量并行 TP API ──
+
+    # CreateTP
+    if hasattr(lib, 'llaisysQwen2ModelCreateTP'):
+        lib.llaisysQwen2ModelCreateTP.argtypes = [
+            ctypes.POINTER(LlaisysQwen2Meta),  # meta
+            ctypes.c_int,                       # device
+            ctypes.c_int,                       # device_id
+            ctypes.c_int,                       # tp_size
+            ctypes.c_int,                       # tp_rank
+        ]
+        lib.llaisysQwen2ModelCreateTP.restype = ctypes.c_void_p
+
+    # GetTpSize
+    if hasattr(lib, 'llaisysQwen2GetTpSize'):
+        lib.llaisysQwen2GetTpSize.argtypes = [ctypes.c_void_p]
+        lib.llaisysQwen2GetTpSize.restype = ctypes.c_int
+
+    # GetTpRank
+    if hasattr(lib, 'llaisysQwen2GetTpRank'):
+        lib.llaisysQwen2GetTpRank.argtypes = [ctypes.c_void_p]
+        lib.llaisysQwen2GetTpRank.restype = ctypes.c_int
+
+    # SetComm
+    if hasattr(lib, 'llaisysQwen2SetComm'):
+        lib.llaisysQwen2SetComm.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.llaisysQwen2SetComm.restype = None
+
 # 执行配置
 _setup_functions()
 
@@ -162,3 +257,19 @@ pool_destroy = LIB_LLAISYS.llaisysKVCachePoolDestroy
 pool_insert = LIB_LLAISYS.llaisysKVCachePoolInsert
 pool_lookup = LIB_LLAISYS.llaisysKVCachePoolLookup
 pool_clear = LIB_LLAISYS.llaisysKVCachePoolClear
+
+# Phase 5 (项目#4) 导出
+batch_context_create = LIB_LLAISYS.llaisysQwen2BatchContextCreate
+batch_context_destroy = LIB_LLAISYS.llaisysQwen2BatchContextDestroy
+batch_slot_reset = LIB_LLAISYS.llaisysQwen2BatchSlotReset
+batch_prefill = LIB_LLAISYS.llaisysQwen2BatchPrefill
+batch_decode = LIB_LLAISYS.llaisysQwen2BatchDecode
+batch_slot_get_pos = LIB_LLAISYS.llaisysQwen2BatchSlotGetPos
+batch_slot_save = LIB_LLAISYS.llaisysQwen2BatchSlotSave
+batch_slot_restore = LIB_LLAISYS.llaisysQwen2BatchSlotRestore
+
+# Phase 5 (项目#5) 导出: 张量并行 TP
+model_create_tp = LIB_LLAISYS.llaisysQwen2ModelCreateTP
+model_get_tp_size = LIB_LLAISYS.llaisysQwen2GetTpSize
+model_get_tp_rank = LIB_LLAISYS.llaisysQwen2GetTpRank
+model_set_comm = LIB_LLAISYS.llaisysQwen2SetComm

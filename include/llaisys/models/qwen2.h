@@ -2,6 +2,7 @@
 #define LLAISYS_MODELS_QWEN2_H
 
 #include "../tensor.h" // 确保包含基础类型定义 (如 llaisysDataType_t, __export, __C)
+#include "../distributed.h" // llaisysDistComm_t
 
 __C {
     // 模型元数据结构体
@@ -53,6 +54,17 @@ __C {
 
     // 创建模型实例
     __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const struct LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice);
+
+    // 创建 TP (张量并行) 模型实例
+    __export struct LlaisysQwen2Model *llaisysQwen2ModelCreateTP(const struct LlaisysQwen2Meta *meta, llaisysDeviceType_t device,
+                                                                 int device_id, int tp_size, int tp_rank);
+
+    // 查询 TP 配置
+    __export int llaisysQwen2GetTpSize(struct LlaisysQwen2Model * model);
+    __export int llaisysQwen2GetTpRank(struct LlaisysQwen2Model * model);
+
+    // 设置 TP 通信句柄 (传 NULL 清除)
+    __export void llaisysQwen2SetComm(struct LlaisysQwen2Model * model, llaisysDistComm_t comm);
 
     // 销毁模型实例
     __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model);
@@ -117,5 +129,57 @@ __C {
 
     // 查询模型是否已加载量化权重
     __export int llaisysQwen2IsQuantized(struct LlaisysQwen2Model * model);
+
+    // ==========================================
+    // Phase 5 (项目#4): 批量推理 API
+    // ==========================================
+
+    // 不透明的批量推理上下文句柄
+    struct LlaisysQwen2BatchContext;
+
+    // 创建批量推理上下文 (预分配 max_batch_size 个 KV-Cache slot)
+    // max_seq_per_slot: 每个 slot 的 KV-Cache 最大序列长度 (0 = 默认 2048)
+    __export struct LlaisysQwen2BatchContext *llaisysQwen2BatchContextCreate(
+        struct LlaisysQwen2Model * model, size_t max_batch_size, size_t max_seq_per_slot);
+
+    // 销毁批量推理上下文
+    __export void llaisysQwen2BatchContextDestroy(
+        struct LlaisysQwen2BatchContext * ctx);
+
+    // 重置指定 slot 的 KV-Cache (清空)
+    __export void llaisysQwen2BatchSlotReset(
+        struct LlaisysQwen2BatchContext * ctx, size_t slot_id);
+
+    // Prefill: 在指定 slot 上对完整 prompt 执行 prefill, 返回首个 next token
+    __export int64_t llaisysQwen2BatchPrefill(
+        struct LlaisysQwen2BatchContext * ctx,
+        size_t slot_id,
+        int64_t * token_ids, size_t ntoken,
+        float temperature, int top_k, float top_p);
+
+    // 批量 Decode: 对 num_active 个活跃 slot 执行一步 decode
+    //   active_slots: [num_active] slot ID 数组
+    //   current_tokens: [num_active] 各 slot 当前 token
+    //   output_tokens: [num_active] 输出的 next token (由调用者分配)
+    __export void llaisysQwen2BatchDecode(
+        struct LlaisysQwen2BatchContext * ctx,
+        size_t * active_slots, size_t num_active,
+        int64_t * current_tokens,
+        float temperature, int top_k, float top_p,
+        int64_t * output_tokens);
+
+    // 获取 slot 当前 KV-Cache 位置
+    __export int64_t llaisysQwen2BatchSlotGetPos(
+        struct LlaisysQwen2BatchContext * ctx, size_t slot_id);
+
+    // 保存 slot 的 KV-Cache 快照
+    __export struct LlaisysQwen2CacheSnapshot *llaisysQwen2BatchSlotSave(
+        struct LlaisysQwen2BatchContext * ctx, size_t slot_id);
+
+    // 从快照恢复 slot 的 KV-Cache
+    __export void llaisysQwen2BatchSlotRestore(
+        struct LlaisysQwen2BatchContext * ctx, size_t slot_id,
+        struct LlaisysQwen2CacheSnapshot * snapshot);
+
 }
 #endif // LLAISYS_MODELS_QWEN2_H

@@ -4,6 +4,10 @@
 #include "nvidia/swiglu_nvidia.cuh"
 #endif
 
+#ifdef ENABLE_METAX_API
+#include "metax/swiglu_metax.hpp"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void swiglu_cpu_kernel(tensor_t out, tensor_t gate, tensor_t up) {
@@ -42,6 +46,12 @@ void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
 #ifdef ENABLE_NVIDIA_API
     if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::swiglu(out, gate, up);
+    }
+#endif
+
+#ifdef ENABLE_METAX_API
+    if (out->deviceType() == LLAISYS_DEVICE_METAX) {
+        return metax::swiglu(out, gate, up);
     }
 #endif
 

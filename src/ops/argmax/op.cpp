@@ -4,6 +4,10 @@
 #include "nvidia/argmax_nvidia.cuh"
 #endif
 
+#ifdef ENABLE_METAX_API
+#include "metax/argmax_metax.hpp"
+#endif
+
 namespace llaisys::ops {
 template <typename T>
 void argmax_cpu_kernel(tensor_t max_idx, tensor_t max_val, tensor_t vals) {
@@ -53,6 +57,12 @@ void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals) {
 #ifdef ENABLE_NVIDIA_API
     if (vals->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::argmax(max_idx, max_val, vals);
+    }
+#endif
+
+#ifdef ENABLE_METAX_API
+    if (vals->deviceType() == LLAISYS_DEVICE_METAX) {
+        return metax::argmax(max_idx, max_val, vals);
     }
 #endif
 

@@ -7,6 +7,11 @@ Phase 4 新增功能:
   - 编辑历史消息 + 重新生成
   - 前缀树 KV-Cache 池 (自动复用已计算的 KV-Cache)
 
+Phase 5 (项目#4) 新增功能:
+  - 多用户并发推理 (请求队列 + 异步 worker)
+  - InferenceEngine 后台线程处理请求
+  - 非阻塞 API: 请求提交到队列, await 结果
+
 Usage:
     python -m server.app --model /path/to/model [--host 0.0.0.0] [--port 8000]
 
@@ -17,7 +22,9 @@ Or from the project root:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import logging
 import sys
 import os
 import time
@@ -51,13 +58,14 @@ from server.models import (
     ChatMessage,
 )
 from server.session import SessionManager
+from server.engine import InferenceEngine, SamplingParams
 
 import llaisys
 from llaisys.libllaisys import DeviceType
 
 # ── Globals (initialised in startup) ─────────────────────────────────
 
-app = FastAPI(title="LLAISYS Chat Server", version="0.2.0")
+app = FastAPI(title="LLAISYS Chat Server", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,12 +79,14 @@ TOKENIZER = None
 MODEL_PATH: str = ""
 DEVICE: DeviceType = DeviceType.CPU
 SESSION_MGR: SessionManager | None = None
+ENGINE: InferenceEngine | None = None
 
 # ── Model Management ─────────────────────────────────────────────────
 
-def load_model(model_path: str, device: str = "cpu") -> None:
+def load_model(model_path: str, device: str = "cpu",
+               tp_size: int = 1, tp_rank: int = 0) -> None:
     """Load model and tokenizer (called once at startup)."""
-    global MODEL, TOKENIZER, MODEL_PATH, DEVICE, SESSION_MGR
+    global MODEL, TOKENIZER, MODEL_PATH, DEVICE, SESSION_MGR, ENGINE
 
     from transformers import AutoTokenizer
     from huggingface_hub import snapshot_download
@@ -89,7 +99,12 @@ def load_model(model_path: str, device: str = "cpu") -> None:
         resolved_path = snapshot_download(model_path)
 
     MODEL_PATH = resolved_path
-    DEVICE = DeviceType.NVIDIA if device == "nvidia" else DeviceType.CPU
+    if device == "nvidia":
+        DEVICE = DeviceType.NVIDIA
+    elif device == "metax":
+        DEVICE = DeviceType.METAX
+    else:
+        DEVICE = DeviceType.CPU
 
     print(f"Loading tokenizer from {resolved_path} ...")
     TOKENIZER = AutoTokenizer.from_pretrained(
@@ -97,12 +112,18 @@ def load_model(model_path: str, device: str = "cpu") -> None:
         trust_remote_code=True,
     )
 
-    print(f"Loading LLAISYS model from {resolved_path} (device={device}) ...")
-    MODEL = llaisys.models.Qwen2(resolved_path, DEVICE)
+    print(f"Loading LLAISYS model from {resolved_path} (device={device}, tp_size={tp_size}, tp_rank={tp_rank}) ...")
+    MODEL = llaisys.models.Qwen2(resolved_path, DEVICE,
+                                  tp_size=tp_size, tp_rank=tp_rank)
 
     # Phase 4: 初始化 Session Manager
     SESSION_MGR = SessionManager(MODEL)
-    print("Model ready. Session manager initialized.")
+
+    # Phase 5 (项目#4): 初始化 InferenceEngine
+    ENGINE = InferenceEngine(MODEL, TOKENIZER)
+    ENGINE.start()
+
+    print("Model ready. Session manager initialized. Inference engine started.")
 
 
 def _reset_model() -> None:
@@ -129,42 +150,41 @@ def _ensure_session(session_id: Optional[str]) -> str:
     return session.session_id
 
 
-# ── Non-streaming endpoint ───────────────────────────────────────────
+# ── Engine-based Non-streaming endpoint ──────────────────────────────
 
-def _generate_full(request: ChatCompletionRequest, session_id: str) -> ChatCompletionResponse:
-    """Generate a complete response (blocking)."""
-    _reset_model()
-
+async def _generate_full_engine(request: ChatCompletionRequest, session_id: str) -> ChatCompletionResponse:
+    """通过 InferenceEngine 生成完整回复 (非阻塞)."""
     input_ids = _encode_messages(request.messages)
     prompt_tokens = len(input_ids)
 
-    # 记录 prefill 前的 cache 位置
-    cache_pos_before = MODEL.get_cache_pos()
-
-    output_ids = MODEL.generate(
-        input_ids,
-        max_new_tokens=request.max_tokens,
+    params = SamplingParams(
+        temperature=request.temperature,
         top_k=request.top_k,
         top_p=request.top_p,
-        temperature=request.temperature,
+        max_tokens=request.max_tokens,
     )
 
-    # Decode only the generated tokens
-    new_tokens = output_ids[prompt_tokens:]
-    text = TOKENIZER.decode(new_tokens, skip_special_tokens=True)
-    completion_tokens = len(new_tokens)
+    loop = asyncio.get_running_loop()
+    req = ENGINE.submit(input_ids, params, session_id, stream=False, loop=loop)
 
-    # Session: 记录用户消息和 assistant 消息
-    cache_pos_after_prefill = prompt_tokens  # prefill 后的位置
-    cache_pos_after_gen = MODEL.get_cache_pos()
+    # 非阻塞等待: worker 线程处理完成后 future 会被 set_result
+    generated_tokens = await req.future
 
+    # 过滤 EOS
+    eos = getattr(MODEL, '_end_token', 151643)
+    if generated_tokens and generated_tokens[-1] == eos:
+        generated_tokens = generated_tokens[:-1]
+
+    text = TOKENIZER.decode(generated_tokens, skip_special_tokens=True)
+    completion_tokens = len(generated_tokens)
+
+    # Session: 记录消息
     for msg in request.messages:
         SESSION_MGR.add_message(session_id, msg.role, msg.content)
-
     SESSION_MGR.add_message(
         session_id, "assistant", text,
-        cache_start_pos=cache_pos_after_prefill,
-        cache_end_pos=cache_pos_after_gen,
+        cache_start_pos=prompt_tokens,
+        cache_end_pos=prompt_tokens + completion_tokens,
     )
 
     return ChatCompletionResponse(
@@ -185,15 +205,25 @@ def _generate_full(request: ChatCompletionRequest, session_id: str) -> ChatCompl
     )
 
 
-# ── Streaming endpoint ───────────────────────────────────────────────
+# ── Engine-based Streaming endpoint ──────────────────────────────────
 
-async def _generate_stream(request: ChatCompletionRequest, session_id: str) -> AsyncGenerator[str, None]:
-    """Yield SSE chunks, one per generated token."""
-    _reset_model()
-
+async def _generate_stream_engine(request: ChatCompletionRequest, session_id: str) -> AsyncGenerator[str, None]:
+    """通过 InferenceEngine 流式生成 (非阻塞, 异步读取 token)."""
     input_ids = _encode_messages(request.messages)
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+
+    params = SamplingParams(
+        temperature=request.temperature,
+        top_k=request.top_k,
+        top_p=request.top_p,
+        max_tokens=request.max_tokens,
+    )
+
+    loop = asyncio.get_running_loop()
+    req = ENGINE.submit(input_ids, params, session_id, stream=True, loop=loop)
+
+    eos = getattr(MODEL, '_end_token', 151643)
 
     # Send initial role chunk
     initial_chunk = ChatCompletionStreamResponse(
@@ -211,16 +241,10 @@ async def _generate_stream(request: ChatCompletionRequest, session_id: str) -> A
     )
     yield f"data: {initial_chunk.model_dump_json()}\n\n"
 
-    # Stream tokens
+    # Stream tokens from engine's output queue
     generated_tokens = []
-    for token_id in MODEL.generate_stream(
-        input_ids,
-        max_new_tokens=request.max_tokens,
-        top_k=request.top_k,
-        top_p=request.top_p,
-        temperature=request.temperature,
-    ):
-        if token_id == 151643:  # EOS
+    async for token_id in req.stream_tokens():
+        if token_id == eos:
             break
 
         generated_tokens.append(token_id)
@@ -243,7 +267,7 @@ async def _generate_stream(request: ChatCompletionRequest, session_id: str) -> A
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
 
-    # Final chunk with finish_reason
+    # Final chunk
     final_chunk = ChatCompletionStreamResponse(
         id=chat_id,
         created=created,
@@ -262,16 +286,63 @@ async def _generate_stream(request: ChatCompletionRequest, session_id: str) -> A
 
     # Session: 记录消息
     full_text = TOKENIZER.decode(generated_tokens, skip_special_tokens=True)
-    cache_pos_after = MODEL.get_cache_pos()
-    prefill_len = len(input_ids)
+    prompt_tokens = len(input_ids)
 
     for msg in request.messages:
         SESSION_MGR.add_message(session_id, msg.role, msg.content)
-
     SESSION_MGR.add_message(
         session_id, "assistant", full_text,
-        cache_start_pos=prefill_len,
-        cache_end_pos=cache_pos_after,
+        cache_start_pos=prompt_tokens,
+        cache_end_pos=prompt_tokens + len(generated_tokens),
+    )
+
+
+# ── Legacy direct-call helpers (used by regenerate/edit) ─────────────
+
+def _generate_full_direct(request: ChatCompletionRequest, session_id: str) -> ChatCompletionResponse:
+    """直接调用模型生成 (阻塞, 用于 regenerate/edit 等内部场景)."""
+    _reset_model()
+
+    input_ids = _encode_messages(request.messages)
+    prompt_tokens = len(input_ids)
+
+    output_ids = MODEL.generate(
+        input_ids,
+        max_new_tokens=request.max_tokens,
+        top_k=request.top_k,
+        top_p=request.top_p,
+        temperature=request.temperature,
+    )
+
+    new_tokens = output_ids[prompt_tokens:]
+    text = TOKENIZER.decode(new_tokens, skip_special_tokens=True)
+    completion_tokens = len(new_tokens)
+
+    cache_pos_after_gen = MODEL.get_cache_pos()
+
+    for msg in request.messages:
+        SESSION_MGR.add_message(session_id, msg.role, msg.content)
+    SESSION_MGR.add_message(
+        session_id, "assistant", text,
+        cache_start_pos=prompt_tokens,
+        cache_end_pos=cache_pos_after_gen,
+    )
+
+    return ChatCompletionResponse(
+        model=request.model,
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=ChatMessageResponse(role="assistant", content=text),
+                finish_reason="stop",
+            )
+        ],
+        usage=UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+        session_id=session_id,
     )
 
 
@@ -398,13 +469,17 @@ async def chat_completions(request: ChatCompletionRequest):
 
     session_id = _ensure_session(request.session_id)
 
-    if request.stream:
-        return StreamingResponse(
-            _generate_stream(request, session_id),
-            media_type="text/event-stream",
-        )
+    # Phase 5: 使用 InferenceEngine (非阻塞, 支持并发)
+    if ENGINE is not None:
+        if request.stream:
+            return StreamingResponse(
+                _generate_stream_engine(request, session_id),
+                media_type="text/event-stream",
+            )
+        return await _generate_full_engine(request, session_id)
 
-    return _generate_full(request, session_id)
+    # Fallback: 直接调用模型 (阻塞)
+    return _generate_full_direct(request, session_id)
 
 
 @app.get("/v1/models")
@@ -423,7 +498,22 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": MODEL is not None}
+    engine_stats = ENGINE.get_stats() if ENGINE else None
+    return {
+        "status": "ok",
+        "model_loaded": MODEL is not None,
+        "engine": engine_stats,
+    }
+
+
+# ── Engine stats endpoint ────────────────────────────────────────────
+
+@app.get("/v1/engine/stats")
+async def engine_stats():
+    """获取推理引擎状态 (队列大小, 活跃请求数等)."""
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    return ENGINE.get_stats()
 
 
 # ── Phase 4: Session Management Routes ───────────────────────────────
@@ -576,9 +666,13 @@ def main():
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "nvidia"])
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--tp-size", type=int, default=1,
+                        help="Tensor parallelism degree (default: 1 = single device)")
+    parser.add_argument("--tp-rank", type=int, default=0,
+                        help="Current TP rank (0-based, for manual launch)")
     args = parser.parse_args()
 
-    load_model(args.model, args.device)
+    load_model(args.model, args.device, tp_size=args.tp_size, tp_rank=args.tp_rank)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)

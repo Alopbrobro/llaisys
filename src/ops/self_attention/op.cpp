@@ -4,6 +4,10 @@
 #include "nvidia/self_attention_nvidia.cuh"
 #endif
 
+#ifdef ENABLE_METAX_API
+#include "metax/self_attention_metax.hpp"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void self_attention_cpu_kernel(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {//1、A = Q * K ^ T  2、softmax(A) 3、softmax(A) * V
@@ -103,6 +107,12 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
 #ifdef ENABLE_NVIDIA_API
     if (attn_val->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::self_attention(attn_val, q, k, v, scale);
+    }
+#endif
+
+#ifdef ENABLE_METAX_API
+    if (attn_val->deviceType() == LLAISYS_DEVICE_METAX) {
+        return metax::self_attention(attn_val, q, k, v, scale);
     }
 #endif
 

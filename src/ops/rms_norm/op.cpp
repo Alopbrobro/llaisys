@@ -4,6 +4,10 @@
 #include "nvidia/rms_norm_nvidia.cuh"
 #endif
 
+#ifdef ENABLE_METAX_API
+#include "metax/rms_norm_metax.hpp"
+#endif
+
 namespace llaisys::ops {
 template<typename T>
 void rms_norm_cpu_kernel(tensor_t out, tensor_t in, tensor_t weight, float eps) {//Y:out    in:X    weight:W
@@ -55,6 +59,12 @@ void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
 #ifdef ENABLE_NVIDIA_API
     if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::rms_norm(out, in, weight, eps);
+    }
+#endif
+
+#ifdef ENABLE_METAX_API
+    if (out->deviceType() == LLAISYS_DEVICE_METAX) {
+        return metax::rms_norm(out, in, weight, eps);
     }
 #endif
 

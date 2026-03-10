@@ -1,7 +1,9 @@
 #include "llaisys/models/qwen2.h"
+#include "llaisys/distributed.h"
 #include "../../ops/op.hpp"
 #include "../../ops/dequantize/op.hpp"
-#include "../../utils/types.hpp"   
+#include "../../utils/types.hpp"
+#include "../../distributed/comm.hpp"   
 #include <vector>
 #include <iostream>
 #include <cstring>
@@ -30,7 +32,10 @@ static inline tensor_t TO_CPP_TENSOR(llaisysTensor_t t) {
 struct LlaisysQwen2CacheSnapshot {
     int64_t pos;            // 保存时的 current_pos
     size_t nlayer;           // transformer 层数
-    size_t pos_bytes;        // 每个位置每个 K/V 的字节数 = nkvh * dh * sizeof(float)
+    size_t pos_bytes;        // 每个位置每个 K/V 的字节数 = local_nkvh * dh * sizeof(float)
+    // TP 元信息 (restore 时校验)
+    int tp_size = 1;
+    int tp_rank = 0;
     // buffers[layer * 2 + 0] = K, buffers[layer * 2 + 1] = V
     // 每个 buffer 大小 = pos * pos_bytes
     std::vector<std::vector<uint8_t>> buffers;
@@ -65,6 +70,16 @@ struct LlaisysQwen2Model {
     LlaisysQwen2Weights weights;
     llaisysDeviceType_t device_type;
     int device_id;
+
+    // ── TP (Tensor Parallel) 字段 ──
+    int tp_size = 1;   // 总并行数
+    int tp_rank = 0;   // 当前 rank
+    // TP 后的本地维度 (tp_size=1 时等于 meta 原值)
+    size_t local_nh;   // = meta.nh / tp_size
+    size_t local_nkvh; // = meta.nkvh / tp_size
+    size_t local_di;   // = meta.di / tp_size
+    // TP 通信句柄 (nullptr 表示单设备 / 不通信)
+    llaisys::distributed::comm_t comm = nullptr;
     
     std::vector<tensor_t> resources;
     std::vector<std::vector<tensor_t>> kv_caches;
@@ -126,8 +141,31 @@ struct LlaisysQwen2Model {
         }
     }
 
-    LlaisysQwen2Model(const LlaisysQwen2Meta* m, llaisysDeviceType_t dev, int dev_id)
-        : meta(*m), device_type(dev), device_id(dev_id >= 0 ? dev_id : 0) {
+    // TP: 若 tp_size>1 且有 comm, 对 tensor 执行 all-reduce sum
+    void allReduceIfTP(tensor_t t, size_t count) {
+        if (tp_size > 1 && comm) {
+            comm->allReduceSum((float*)t->data(), count);
+        }
+    }
+
+    LlaisysQwen2Model(const LlaisysQwen2Meta* m, llaisysDeviceType_t dev, int dev_id,
+                      int tp_sz = 1, int tp_rk = 0)
+        : meta(*m), device_type(dev), device_id(dev_id >= 0 ? dev_id : 0),
+          tp_size(tp_sz), tp_rank(tp_rk) {
+        // 验证 TP 维度可整除
+        if (tp_size < 1) tp_size = 1;
+        if (tp_rank < 0 || tp_rank >= tp_size) tp_rank = 0;
+        if (tp_size > 1) {
+            if (meta.nh % tp_size != 0 || meta.nkvh % tp_size != 0 || meta.di % tp_size != 0) {
+                std::cerr << "[qwen2] ERROR: nh=" << meta.nh << " nkvh=" << meta.nkvh
+                          << " di=" << meta.di << " not divisible by tp_size=" << tp_size << std::endl;
+                tp_size = 1;
+                tp_rank = 0;
+            }
+        }
+        local_nh = meta.nh / tp_size;
+        local_nkvh = meta.nkvh / tp_size;
+        local_di = meta.di / tp_size;
         weights.in_embed = nullptr;
         weights.out_embed = nullptr;
         weights.out_norm_w = nullptr;
@@ -174,7 +212,8 @@ struct LlaisysQwen2Model {
     }
 
     void init_cache() {
-        std::vector<size_t> shape = {meta.maxseq, meta.nkvh, meta.dh};
+        // TP: 每个 rank 只存 local_nkvh 个 KV head
+        std::vector<size_t> shape = {meta.maxseq, local_nkvh, meta.dh};
         for (size_t i = 0; i < meta.nlayer; ++i) {
             auto k_c = Tensor::create(shape, LLAISYS_DTYPE_F32, device_type, device_id);
             auto v_c = Tensor::create(shape, LLAISYS_DTYPE_F32, device_type, device_id);
@@ -190,18 +229,20 @@ struct LlaisysQwen2Model {
         residual = Tensor::create({1, meta.hs}, LLAISYS_DTYPE_F32, device_type, device_id);
         norm_out = Tensor::create({1, meta.hs}, LLAISYS_DTYPE_F32, device_type, device_id);
 
-        size_t q_dim = meta.nh * meta.dh;
-        size_t kv_dim = meta.nkvh * meta.dh;
+        // TP: Q/K/V/attn_out 使用 local head 数
+        size_t q_dim = local_nh * meta.dh;
+        size_t kv_dim = local_nkvh * meta.dh;
         
         q = Tensor::create({1, q_dim}, LLAISYS_DTYPE_F32, device_type, device_id);
         k = Tensor::create({1, kv_dim}, LLAISYS_DTYPE_F32, device_type, device_id);
         v = Tensor::create({1, kv_dim}, LLAISYS_DTYPE_F32, device_type, device_id);
         
-        attn_out = Tensor::create({1, meta.nh, meta.dh}, LLAISYS_DTYPE_F32, device_type, device_id);
+        attn_out = Tensor::create({1, local_nh, meta.dh}, LLAISYS_DTYPE_F32, device_type, device_id);
         
-        gate = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32, device_type, device_id);
-        up = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32, device_type, device_id);
-        mlp_act = Tensor::create({1, meta.di}, LLAISYS_DTYPE_F32, device_type, device_id);
+        // TP: MLP 使用 local_di
+        gate = Tensor::create({1, local_di}, LLAISYS_DTYPE_F32, device_type, device_id);
+        up = Tensor::create({1, local_di}, LLAISYS_DTYPE_F32, device_type, device_id);
+        mlp_act = Tensor::create({1, local_di}, LLAISYS_DTYPE_F32, device_type, device_id);
         
         logits = Tensor::create({1, meta.voc}, LLAISYS_DTYPE_F32, device_type, device_id);
         next_token = Tensor::create({1}, LLAISYS_DTYPE_I32, device_type, device_id);
@@ -254,6 +295,78 @@ struct LlaisysQwen2Model {
 };
 
 // ==========================================
+// 2.5 TP 权重分片辅助
+// ==========================================
+
+enum class TpSlice { None, ColDim0, RowDim1 };
+
+// 判断参数名对应的 TP 切分策略
+static TpSlice classifyWeight(const std::string& suffix) {
+    // Column Parallel (按 out_features / dim 0 切分)
+    if (suffix == "self_attn.q_proj.weight" || suffix == "self_attn.q_proj.bias" ||
+        suffix == "self_attn.q_proj.weight.scale" ||
+        suffix == "self_attn.k_proj.weight" || suffix == "self_attn.k_proj.bias" ||
+        suffix == "self_attn.k_proj.weight.scale" ||
+        suffix == "self_attn.v_proj.weight" || suffix == "self_attn.v_proj.bias" ||
+        suffix == "self_attn.v_proj.weight.scale" ||
+        suffix == "mlp.gate_proj.weight" || suffix == "mlp.gate_proj.weight.scale" ||
+        suffix == "mlp.up_proj.weight" || suffix == "mlp.up_proj.weight.scale") {
+        return TpSlice::ColDim0;
+    }
+    // Row Parallel (按 in_features / dim 1 切分)
+    if (suffix == "self_attn.o_proj.weight" ||
+        suffix == "mlp.down_proj.weight") {
+        return TpSlice::RowDim1;
+    }
+    // 不切分：embedding, norm, lm_head, row-parallel 的 scale
+    return TpSlice::None;
+}
+
+// 在 CPU 上切分 2D 权重 [rows, cols]，返回切片数据和新 shape
+static std::vector<uint8_t> slice2D(const void* data, size_t rows, size_t cols,
+                                     size_t elem_size, TpSlice how,
+                                     int tp_size, int tp_rank,
+                                     size_t& out_rows, size_t& out_cols) {
+    if (how == TpSlice::ColDim0) {
+        // 按 dim 0 (行) 切分 — 数据连续
+        out_rows = rows / tp_size;
+        out_cols = cols;
+        size_t offset = tp_rank * out_rows * cols * elem_size;
+        size_t bytes = out_rows * cols * elem_size;
+        std::vector<uint8_t> buf(bytes);
+        std::memcpy(buf.data(), (const uint8_t*)data + offset, bytes);
+        return buf;
+    } else {
+        // 按 dim 1 (列) 切分 — 需逐行拷贝
+        out_rows = rows;
+        out_cols = cols / tp_size;
+        size_t row_bytes = out_cols * elem_size;
+        size_t offset_cols = tp_rank * out_cols;
+        size_t bytes = rows * row_bytes;
+        std::vector<uint8_t> buf(bytes);
+        for (size_t r = 0; r < rows; ++r) {
+            const uint8_t* src = (const uint8_t*)data + (r * cols + offset_cols) * elem_size;
+            uint8_t* dst = buf.data() + r * row_bytes;
+            std::memcpy(dst, src, row_bytes);
+        }
+        return buf;
+    }
+}
+
+// 切分 1D 张量 [size]
+static std::vector<uint8_t> slice1D(const void* data, size_t size,
+                                     size_t elem_size,
+                                     int tp_size, int tp_rank,
+                                     size_t& out_size) {
+    out_size = size / tp_size;
+    size_t offset = tp_rank * out_size * elem_size;
+    size_t bytes = out_size * elem_size;
+    std::vector<uint8_t> buf(bytes);
+    std::memcpy(buf.data(), (const uint8_t*)data + offset, bytes);
+    return buf;
+}
+
+// ==========================================
 // 3. C 接口实现
 // ==========================================
 
@@ -263,6 +376,33 @@ __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Met
     if (!meta) return nullptr;
     int dev_id = (device_ids && ndevice > 0) ? device_ids[0] : 0;
     return new LlaisysQwen2Model(meta, device, dev_id);
+}
+
+__export struct LlaisysQwen2Model *llaisysQwen2ModelCreateTP(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device,
+                                                             int device_id, int tp_size, int tp_rank) {
+    if (!meta) return nullptr;
+    return new LlaisysQwen2Model(meta, device, device_id >= 0 ? device_id : 0, tp_size, tp_rank);
+}
+
+__export int llaisysQwen2GetTpSize(struct LlaisysQwen2Model * model) {
+    if (!model) return 1;
+    return model->tp_size;
+}
+
+__export int llaisysQwen2GetTpRank(struct LlaisysQwen2Model * model) {
+    if (!model) return 0;
+    return model->tp_rank;
+}
+
+__export void llaisysQwen2SetComm(struct LlaisysQwen2Model * model, llaisysDistComm_t comm_handle) {
+    if (!model) return;
+    if (comm_handle) {
+        // 从 C handle 获取内部 shared_ptr<Comm>
+        auto* impl_ptr = (llaisys::distributed::comm_t*)llaisysDistCommGetImplPtr(comm_handle);
+        if (impl_ptr) model->comm = *impl_ptr;
+    } else {
+        model->comm = nullptr;
+    }
 }
 
 __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model) {
@@ -308,16 +448,16 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             model->linear_maybe_dequant(model->v, model->norm_out, model->weights.attn_v_w[i], model->weights.attn_v_w_scale[i], model->weights.attn_v_b[i]);
 
             // C. RoPE
-            auto q_3d = model->q->reshape({1, model->meta.nh, model->meta.dh});
-            auto k_3d = model->k->reshape({1, model->meta.nkvh, model->meta.dh});
-            auto v_3d = model->v->reshape({1, model->meta.nkvh, model->meta.dh});
+            auto q_3d = model->q->reshape({1, model->local_nh, model->meta.dh});
+            auto k_3d = model->k->reshape({1, model->local_nkvh, model->meta.dh});
+            auto v_3d = model->v->reshape({1, model->local_nkvh, model->meta.dh});
 
             ops::rope(q_3d, q_3d, model->pos_ids_buf, model->meta.theta);
             ops::rope(k_3d, k_3d, model->pos_ids_buf, model->meta.theta);
 
             // D. Update KV Cache
             if (model->current_pos < (int64_t)model->meta.maxseq) {
-                size_t bytes = model->meta.nkvh * model->meta.dh * 4;
+                size_t bytes = model->local_nkvh * model->meta.dh * 4;
                 char* k_dst = (char*)model->kv_caches[i][0]->data() + model->current_pos * bytes;
                 char* v_dst = (char*)model->kv_caches[i][1]->data() + model->current_pos * bytes;
                 model->memcpyOnDevice(k_dst, k_3d->data(), bytes);
@@ -331,9 +471,12 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             
             ops::self_attention(model->attn_out, q_3d, k_slice, v_slice, scale);
 
-            // F. Output Projection
-            auto attn_flat = model->attn_out->reshape({1, model->meta.hs});
+            // F. Output Projection (TP: attn_out 是 local head 视图)
+            auto attn_flat = model->attn_out->reshape({1, model->local_nh * model->meta.dh});
             model->linear_maybe_dequant(model->hidden_states, attn_flat, model->weights.attn_o_w[i], model->weights.attn_o_w_scale[i], nullptr);
+
+            // TP: O proj 是 row parallel, 需要 all-reduce
+            model->allReduceIfTP(model->hidden_states, model->meta.hs);
 
             // G. Residual Add 1
             ops::add(model->hidden_states, model->hidden_states, model->residual);
@@ -348,6 +491,9 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             ops::swiglu(model->mlp_act, model->gate, model->up);
             
             model->linear_maybe_dequant(model->hidden_states, model->mlp_act, model->weights.mlp_down_w[i], model->weights.mlp_down_w_scale[i], nullptr);
+
+            // TP: down proj 是 row parallel, 需要 all-reduce
+            model->allReduceIfTP(model->hidden_states, model->meta.hs);
 
             // I. Residual Add 2
             ops::add(model->hidden_states, model->hidden_states, model->residual);
@@ -403,16 +549,16 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
             model->linear_maybe_dequant(model->k, model->norm_out, model->weights.attn_k_w[i], model->weights.attn_k_w_scale[i], model->weights.attn_k_b[i]);
             model->linear_maybe_dequant(model->v, model->norm_out, model->weights.attn_v_w[i], model->weights.attn_v_w_scale[i], model->weights.attn_v_b[i]);
 
-            auto q_3d = model->q->reshape({1, model->meta.nh, model->meta.dh});
-            auto k_3d = model->k->reshape({1, model->meta.nkvh, model->meta.dh});
-            auto v_3d = model->v->reshape({1, model->meta.nkvh, model->meta.dh});
+            auto q_3d = model->q->reshape({1, model->local_nh, model->meta.dh});
+            auto k_3d = model->k->reshape({1, model->local_nkvh, model->meta.dh});
+            auto v_3d = model->v->reshape({1, model->local_nkvh, model->meta.dh});
 
             ops::rope(q_3d, q_3d, model->pos_ids_buf, model->meta.theta);
             ops::rope(k_3d, k_3d, model->pos_ids_buf, model->meta.theta);
             
             //kv cache
             if (model->current_pos < (int64_t)model->meta.maxseq) {
-                size_t bytes = model->meta.nkvh * model->meta.dh * 4;
+                size_t bytes = model->local_nkvh * model->meta.dh * 4;
                 char* k_dst = (char*)model->kv_caches[i][0]->data() + model->current_pos * bytes;
                 char* v_dst = (char*)model->kv_caches[i][1]->data() + model->current_pos * bytes;
                 model->memcpyOnDevice(k_dst, k_3d->data(), bytes);
@@ -425,8 +571,10 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
 
             ops::self_attention(model->attn_out, q_3d, k_slice, v_slice, scale);
 
-            auto attn_flat = model->attn_out->reshape({1, model->meta.hs});
+            auto attn_flat = model->attn_out->reshape({1, model->local_nh * model->meta.dh});
             model->linear_maybe_dequant(model->hidden_states, attn_flat, model->weights.attn_o_w[i], model->weights.attn_o_w_scale[i], nullptr);
+            // TP: O proj row parallel → all-reduce
+            model->allReduceIfTP(model->hidden_states, model->meta.hs);
             ops::add(model->hidden_states, model->hidden_states, model->residual);
 
             std::swap(model->residual, model->hidden_states);
@@ -435,6 +583,8 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
             model->linear_maybe_dequant(model->up, model->norm_out, model->weights.mlp_up_w[i], model->weights.mlp_up_w_scale[i], nullptr);
             ops::swiglu(model->mlp_act, model->gate, model->up);
             model->linear_maybe_dequant(model->hidden_states, model->mlp_act, model->weights.mlp_down_w[i], model->weights.mlp_down_w_scale[i], nullptr);
+            // TP: down proj row parallel → all-reduce
+            model->allReduceIfTP(model->hidden_states, model->meta.hs);
             ops::add(model->hidden_states, model->hidden_states, model->residual);
         }
 
@@ -475,13 +625,6 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
         shape_vec.push_back((size_t)shape[i]);
         numel *= shape[i];
     }
-    
-    // 在目标设备上创建 tensor，通过 load() 完成 H2D 传输
-    auto tensor = llaisys::Tensor::create(shape_vec, (llaisysDataType_t)dtype, model->device_type, model->device_id);
-    tensor->load(data);
-
-    model->resources.push_back(tensor);
-    llaisysTensor_t t_handle = reinterpret_cast<llaisysTensor_t>(tensor.get()); 
 
     // 如果加载了 INT8 或 U8 (INT4 packed) 类型的权重，标记模型为量化模式
     if ((llaisysDataType_t)dtype == LLAISYS_DTYPE_I8 || (llaisysDataType_t)dtype == LLAISYS_DTYPE_U8) {
@@ -489,6 +632,52 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
     }
     
     std::string key(name);
+    size_t elem_size = llaisys::utils::dsize((llaisysDataType_t)dtype);
+
+    // ── 判断 TP 切分策略 ──
+    TpSlice how = TpSlice::None;
+    if (model->tp_size > 1) {
+        // 分层权重: 提取 suffix 用于分类
+        if (key.find("model.layers.") == 0) {
+            size_t first_dot = 13;
+            size_t second_dot = key.find('.', first_dot);
+            std::string suffix = key.substr(second_dot + 1);
+            how = classifyWeight(suffix);
+        }
+        // 顶层权重 (embed, norm, lm_head) → TpSlice::None (不切分，全量复制)
+    }
+
+    // ── 根据 TP 策略创建 tensor (可能先在 CPU 切片) ──
+    tensor_t tensor;
+    if (how == TpSlice::None || model->tp_size <= 1) {
+        // 无切分: 原始行为
+        tensor = llaisys::Tensor::create(shape_vec, (llaisysDataType_t)dtype, model->device_type, model->device_id);
+        tensor->load(data);
+    } else if (ndim == 2) {
+        // 2D 权重切分
+        size_t rows = shape_vec[0], cols = shape_vec[1];
+        size_t out_rows, out_cols;
+        auto sliced = slice2D(data, rows, cols, elem_size, how,
+                              model->tp_size, model->tp_rank, out_rows, out_cols);
+        std::vector<size_t> new_shape = {out_rows, out_cols};
+        tensor = llaisys::Tensor::create(new_shape, (llaisysDataType_t)dtype, model->device_type, model->device_id);
+        tensor->load(sliced.data());
+    } else if (ndim == 1 && how == TpSlice::ColDim0) {
+        // 1D (bias / scale) + column parallel → 切分
+        size_t out_size;
+        auto sliced = slice1D(data, shape_vec[0], elem_size,
+                              model->tp_size, model->tp_rank, out_size);
+        std::vector<size_t> new_shape = {out_size};
+        tensor = llaisys::Tensor::create(new_shape, (llaisysDataType_t)dtype, model->device_type, model->device_id);
+        tensor->load(sliced.data());
+    } else {
+        // 1D + row parallel (scale 不切分) 或其他 → 不切分
+        tensor = llaisys::Tensor::create(shape_vec, (llaisysDataType_t)dtype, model->device_type, model->device_id);
+        tensor->load(data);
+    }
+
+    model->resources.push_back(tensor);
+    llaisysTensor_t t_handle = reinterpret_cast<llaisysTensor_t>(tensor.get()); 
 
     // ── 处理 .scale 后缀 (量化 per-channel scale) ──
     if (key == "lm_head.weight.scale") { model->weights.out_embed_scale = t_handle; return; }
@@ -539,7 +728,9 @@ __export struct LlaisysQwen2CacheSnapshot *llaisysQwen2SaveCache(struct LlaisysQ
     auto* snap = new LlaisysQwen2CacheSnapshot();
     snap->pos = model->current_pos;
     snap->nlayer = model->meta.nlayer;
-    snap->pos_bytes = model->meta.nkvh * model->meta.dh * sizeof(float);
+    snap->pos_bytes = model->local_nkvh * model->meta.dh * sizeof(float);
+    snap->tp_size = model->tp_size;
+    snap->tp_rank = model->tp_rank;
 
     size_t total_bytes_per_buf = snap->pos * snap->pos_bytes;
     snap->buffers.resize(snap->nlayer * 2);
@@ -559,6 +750,13 @@ __export struct LlaisysQwen2CacheSnapshot *llaisysQwen2SaveCache(struct LlaisysQ
 __export void llaisysQwen2RestoreCache(struct LlaisysQwen2Model * model, struct LlaisysQwen2CacheSnapshot * snapshot) {
     if (!model || !snapshot) return;
     if (snapshot->nlayer != model->meta.nlayer) return;
+    // TP 兼容性校验: snapshot 必须与当前模型的 TP 配置匹配
+    if (snapshot->tp_size != model->tp_size || snapshot->tp_rank != model->tp_rank) {
+        std::cerr << "[qwen2] RestoreCache: TP mismatch (snapshot tp_size=" << snapshot->tp_size
+                  << " tp_rank=" << snapshot->tp_rank << " vs model tp_size=" << model->tp_size
+                  << " tp_rank=" << model->tp_rank << ")" << std::endl;
+        return;
+    }
 
     model->current_pos = snapshot->pos;
     size_t total_bytes = snapshot->pos * snapshot->pos_bytes;
@@ -654,6 +852,447 @@ __export void llaisysKVCachePoolClear(struct LlaisysKVCachePool * pool) {
 __export int llaisysQwen2IsQuantized(struct LlaisysQwen2Model * model) {
     if (!model) return 0;
     return model->has_quantized ? 1 : 0;
+}
+
+// ==========================================
+// 6. Phase 5 (项目#4): 批量推理上下文
+// ==========================================
+
+// Per-slot KV-Cache 状态
+struct BatchSlot {
+    std::vector<std::vector<tensor_t>> kv_caches; // [nlayer][2] (K, V)
+    int64_t current_pos = 0;
+    bool active = false;
+
+    void init(size_t nlayer, size_t maxseq, size_t nkvh, size_t dh,
+              llaisysDeviceType_t dev_type, int dev_id) {
+        std::vector<size_t> shape = {maxseq, nkvh, dh};
+        kv_caches.clear();
+        for (size_t i = 0; i < nlayer; ++i) {
+            auto k_c = Tensor::create(shape, LLAISYS_DTYPE_F32, dev_type, dev_id);
+            auto v_c = Tensor::create(shape, LLAISYS_DTYPE_F32, dev_type, dev_id);
+            kv_caches.push_back({k_c, v_c});
+        }
+        current_pos = 0;
+        active = false;
+    }
+
+    void reset() {
+        current_pos = 0;
+        active = false;
+    }
+};
+
+struct LlaisysQwen2BatchContext {
+    LlaisysQwen2Model* model;
+    size_t max_batch_size;
+    size_t max_seq_per_slot;  // per-slot KV-cache 最大序列长度
+    std::vector<BatchSlot> slots;
+
+    // Batch 缓冲区 (按 max_batch_size 预分配)
+    tensor_t batch_input_ids;    // [max_batch]      I64
+    tensor_t batch_pos_ids;      // [max_batch]      I64
+    tensor_t batch_hidden;       // [max_batch, hs]  F32
+    tensor_t batch_residual;     // [max_batch, hs]  F32
+    tensor_t batch_norm_out;     // [max_batch, hs]  F32
+    tensor_t batch_q;            // [max_batch, q_dim]  F32
+    tensor_t batch_k;            // [max_batch, kv_dim] F32
+    tensor_t batch_v;            // [max_batch, kv_dim] F32
+    tensor_t batch_attn_out;     // [max_batch, hs]  F32  (nh * dh = hs)
+    tensor_t batch_gate;         // [max_batch, di]  F32
+    tensor_t batch_up;           // [max_batch, di]  F32
+    tensor_t batch_mlp_act;      // [max_batch, di]  F32
+    tensor_t batch_logits;       // [max_batch, voc] F32
+
+    // 单请求临时缓冲区 (用于 per-slot attention)
+    tensor_t single_q;           // [1, nh, dh]
+    tensor_t single_attn_out;    // [1, nh, dh]
+    tensor_t single_logits;      // [1, voc]
+    tensor_t single_next_token;  // [1] I32
+    tensor_t single_max_val;     // [1] F32
+
+    LlaisysQwen2BatchContext(LlaisysQwen2Model* m, size_t max_bs, size_t max_seq = 0)
+        : model(m), max_batch_size(max_bs)
+    {
+        auto& meta = model->meta;
+        auto dev = model->device_type;
+        auto dev_id = model->device_id;
+        // TP: 使用本地维度
+        size_t q_dim = model->local_nh * meta.dh;
+        size_t kv_dim = model->local_nkvh * meta.dh;
+
+        // per-slot 最大序列长度, 默认 2048 (避免 maxseq=32768 导致 OOM)
+        max_seq_per_slot = (max_seq > 0 && max_seq <= meta.maxseq) ? max_seq : std::min((size_t)2048, meta.maxseq);
+
+        // 初始化 slots
+        slots.resize(max_bs);
+        for (size_t i = 0; i < max_bs; ++i) {
+            slots[i].init(meta.nlayer, max_seq_per_slot, model->local_nkvh, meta.dh, dev, dev_id);
+        }
+
+        // 初始化 batch 缓冲区
+        batch_input_ids = Tensor::create({max_bs}, LLAISYS_DTYPE_I64, dev, dev_id);
+        batch_pos_ids   = Tensor::create({max_bs}, LLAISYS_DTYPE_I64, dev, dev_id);
+        batch_hidden    = Tensor::create({max_bs, meta.hs}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_residual  = Tensor::create({max_bs, meta.hs}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_norm_out  = Tensor::create({max_bs, meta.hs}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_q         = Tensor::create({max_bs, q_dim}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_k         = Tensor::create({max_bs, kv_dim}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_v         = Tensor::create({max_bs, kv_dim}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_attn_out  = Tensor::create({max_bs, model->local_nh * meta.dh}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_gate      = Tensor::create({max_bs, model->local_di}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_up        = Tensor::create({max_bs, model->local_di}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_mlp_act   = Tensor::create({max_bs, model->local_di}, LLAISYS_DTYPE_F32, dev, dev_id);
+        batch_logits    = Tensor::create({max_bs, meta.voc}, LLAISYS_DTYPE_F32, dev, dev_id);
+
+        // 单请求缓冲区
+        single_q        = Tensor::create({1, model->local_nh, meta.dh}, LLAISYS_DTYPE_F32, dev, dev_id);
+        single_attn_out = Tensor::create({1, model->local_nh, meta.dh}, LLAISYS_DTYPE_F32, dev, dev_id);
+        single_logits   = Tensor::create({1, meta.voc}, LLAISYS_DTYPE_F32, dev, dev_id);
+        single_next_token = Tensor::create({1}, LLAISYS_DTYPE_I32, dev, dev_id);
+        single_max_val    = Tensor::create({1}, LLAISYS_DTYPE_F32, dev, dev_id);
+    }
+
+    // 量化感知 linear (复用 model 的 dequant cache)
+    void linear_maybe_dequant(tensor_t out, tensor_t in,
+                              llaisysTensor_t w_handle, llaisysTensor_t scale_handle,
+                              llaisysTensor_t bias_handle) {
+        model->linear_maybe_dequant(out, in, w_handle, scale_handle, bias_handle);
+    }
+};
+
+// ── 批量 Prefill (单 slot) ────────────────────────────────────────
+
+static int64_t batch_prefill_impl(LlaisysQwen2BatchContext* ctx, size_t slot_id,
+                                   int64_t* token_ids, size_t ntoken,
+                                   float temperature, int top_k, float top_p) {
+    auto* model = ctx->model;
+    auto& slot = ctx->slots[slot_id];
+    bool use_greedy = (top_k == 1) || (temperature <= 0.0f);
+
+    // 使用 model 的单序列推理 buffer 和方法 (prefill 不需要跨请求 batch)
+    // 临时切换 model 的 kv_caches 到 slot 的 kv_caches
+    auto saved_caches = model->kv_caches;
+    auto saved_pos = model->current_pos;
+    model->kv_caches = slot.kv_caches;
+    model->current_pos = slot.current_pos;
+
+    // 如果 current_pos > 0, prefill 不重置 (支持增量 prefill)
+    // 否则 ntoken > 1 时 model_infer 会重置
+    int64_t output_token = 0;
+    if (use_greedy) {
+        output_token = llaisysQwen2ModelInfer(model, token_ids, ntoken);
+    } else {
+        output_token = llaisysQwen2ModelInferSample(model, token_ids, ntoken,
+                                                     temperature, top_k, top_p);
+    }
+
+    // 保存 slot 状态
+    slot.current_pos = model->current_pos;
+    slot.active = true;
+
+    // 恢复 model 状态
+    model->kv_caches = saved_caches;
+    model->current_pos = saved_pos;
+
+    return output_token;
+}
+
+// ── 批量 Decode ────────────────────────────────────────────────────
+
+static void batch_decode_impl(LlaisysQwen2BatchContext* ctx,
+                               size_t* active_slots, size_t num_active,
+                               int64_t* current_tokens,
+                               float temperature, int top_k, float top_p,
+                               int64_t* output_tokens) {
+    if (num_active == 0) return;
+
+    auto* model = ctx->model;
+    auto& meta = model->meta;
+    size_t B = num_active;
+    size_t q_dim = model->local_nh * meta.dh;
+    size_t kv_dim = model->local_nkvh * meta.dh;
+    size_t kv_bytes = kv_dim * sizeof(float);
+    bool use_greedy = (top_k == 1) || (temperature <= 0.0f);
+
+    // ── 1. 准备输入 (H2D) ──
+    // 创建 batch view (使用 slice 控制实际大小)
+    auto b_input  = ctx->batch_input_ids->slice(0, 0, B);
+    auto b_pos    = ctx->batch_pos_ids->slice(0, 0, B);
+    auto b_hidden = ctx->batch_hidden->slice(0, 0, B);
+    auto b_resid  = ctx->batch_residual->slice(0, 0, B);
+    auto b_norm   = ctx->batch_norm_out->slice(0, 0, B);
+    auto b_q      = ctx->batch_q->slice(0, 0, B);
+    auto b_k      = ctx->batch_k->slice(0, 0, B);
+    auto b_v      = ctx->batch_v->slice(0, 0, B);
+    auto b_attn   = ctx->batch_attn_out->slice(0, 0, B);
+    auto b_gate   = ctx->batch_gate->slice(0, 0, B);
+    auto b_up     = ctx->batch_up->slice(0, 0, B);
+    auto b_mlp    = ctx->batch_mlp_act->slice(0, 0, B);
+    auto b_logits = ctx->batch_logits->slice(0, 0, B);
+
+    // 写入 batch token ids 和 position ids
+    std::vector<int64_t> host_tokens(B);
+    std::vector<int64_t> host_positions(B);
+    for (size_t i = 0; i < B; ++i) {
+        host_tokens[i] = current_tokens[i];
+        host_positions[i] = ctx->slots[active_slots[i]].current_pos;
+    }
+    model->memcpyH2D(b_input, host_tokens.data(), B * sizeof(int64_t));
+    model->memcpyH2D(b_pos, host_positions.data(), B * sizeof(int64_t));
+
+    // ── 2. 批量 Embedding ──
+    ops::embedding(b_hidden, b_input, TO_CPP_TENSOR(model->weights.in_embed));
+
+    // ── 3. Transformer Layers ──
+    for (size_t layer = 0; layer < meta.nlayer; ++layer) {
+        // Swap residual ← hidden
+        std::swap(b_resid, b_hidden);
+
+        // A. Pre-Norm (batch)
+        ops::rms_norm(b_norm, b_resid,
+                      TO_CPP_TENSOR(model->weights.attn_norm_w[layer]),
+                      meta.epsilon);
+
+        // B. QKV Linear (batch)
+        ctx->linear_maybe_dequant(b_q, b_norm,
+            model->weights.attn_q_w[layer], model->weights.attn_q_w_scale[layer],
+            model->weights.attn_q_b[layer]);
+        ctx->linear_maybe_dequant(b_k, b_norm,
+            model->weights.attn_k_w[layer], model->weights.attn_k_w_scale[layer],
+            model->weights.attn_k_b[layer]);
+        ctx->linear_maybe_dequant(b_v, b_norm,
+            model->weights.attn_v_w[layer], model->weights.attn_v_w_scale[layer],
+            model->weights.attn_v_b[layer]);
+
+        // C. RoPE (batch): reshape [B, nh*dh] → [B, nh, dh], pos_ids = [B]
+        auto q_3d = b_q->reshape({B, model->local_nh, meta.dh});
+        auto k_3d = b_k->reshape({B, model->local_nkvh, meta.dh});
+        ops::rope(q_3d, q_3d, b_pos, meta.theta);
+        ops::rope(k_3d, k_3d, b_pos, meta.theta);
+
+        // D. Per-slot: KV-Cache update + Self-Attention
+        auto v_3d = b_v->reshape({B, model->local_nkvh, meta.dh});
+        float scale = 1.0f / std::sqrt((float)meta.dh);
+
+        for (size_t i = 0; i < B; ++i) {
+            size_t sid = active_slots[i];
+            auto& slot = ctx->slots[sid];
+            int64_t pos = slot.current_pos;
+
+            // 从 batch buffer 中提取第 i 个请求的 KV
+            // k_3d[i, :, :] → single row in kv_cache
+            if (pos < (int64_t)meta.maxseq) {
+                char* k_src = (char*)k_3d->data() + i * kv_bytes;
+                char* v_src = (char*)v_3d->data() + i * kv_bytes;
+                char* k_dst = (char*)slot.kv_caches[layer][0]->data() + pos * kv_bytes;
+                char* v_dst = (char*)slot.kv_caches[layer][1]->data() + pos * kv_bytes;
+                model->memcpyOnDevice(k_dst, k_src, kv_bytes);
+                model->memcpyOnDevice(v_dst, v_src, kv_bytes);
+            }
+
+            // 提取第 i 个请求的 Q → single_q [1, nh, dh]
+            size_t q_bytes = q_dim * sizeof(float);
+            char* q_src = (char*)q_3d->data() + i * q_bytes;
+            model->memcpyOnDevice(ctx->single_q->data(), q_src, q_bytes);
+
+            // Self-Attention
+            auto k_slice = slot.kv_caches[layer][0]->slice(0, 0, pos + 1);
+            auto v_slice = slot.kv_caches[layer][1]->slice(0, 0, pos + 1);
+            ops::self_attention(ctx->single_attn_out, ctx->single_q, k_slice, v_slice, scale);
+
+            // 写回到 batch_attn_out[i]
+            size_t attn_bytes = model->local_nh * meta.dh * sizeof(float);
+            char* attn_dst = (char*)b_attn->data() + i * attn_bytes;
+            model->memcpyOnDevice(attn_dst, ctx->single_attn_out->data(), attn_bytes);
+        }
+
+        // E. O Projection (batch)
+        ctx->linear_maybe_dequant(b_hidden, b_attn,
+            model->weights.attn_o_w[layer], model->weights.attn_o_w_scale[layer],
+            nullptr);
+        // TP: O proj row parallel → all-reduce
+        model->allReduceIfTP(b_hidden, B * meta.hs);
+
+        // F. Residual Add 1 (batch)
+        ops::add(b_hidden, b_hidden, b_resid);
+
+        // G. MLP Block (batch)
+        std::swap(b_resid, b_hidden);
+        ops::rms_norm(b_norm, b_resid,
+                      TO_CPP_TENSOR(model->weights.mlp_norm_w[layer]),
+                      meta.epsilon);
+
+        ctx->linear_maybe_dequant(b_gate, b_norm,
+            model->weights.mlp_gate_w[layer], model->weights.mlp_gate_w_scale[layer],
+            nullptr);
+        ctx->linear_maybe_dequant(b_up, b_norm,
+            model->weights.mlp_up_w[layer], model->weights.mlp_up_w_scale[layer],
+            nullptr);
+        ops::swiglu(b_mlp, b_gate, b_up);
+        ctx->linear_maybe_dequant(b_hidden, b_mlp,
+            model->weights.mlp_down_w[layer], model->weights.mlp_down_w_scale[layer],
+            nullptr);
+        // TP: down proj row parallel → all-reduce
+        model->allReduceIfTP(b_hidden, B * meta.hs);
+
+        // H. Residual Add 2 (batch)
+        ops::add(b_hidden, b_hidden, b_resid);
+    }
+
+    // ── 4. Final Norm (batch) ──
+    ops::rms_norm(b_hidden, b_hidden,
+                  TO_CPP_TENSOR(model->weights.out_norm_w), meta.epsilon);
+
+    // ── 5. LM Head (batch) ──
+    ctx->linear_maybe_dequant(b_logits, b_hidden,
+        model->weights.out_embed, model->weights.out_embed_scale, nullptr);
+
+    // ── 6. Per-slot Argmax/Sample + KV-Cache pos update ──
+    for (size_t i = 0; i < B; ++i) {
+        size_t sid = active_slots[i];
+
+        // 提取第 i 个请求的 logits → single_logits [1, voc]
+        size_t logits_bytes = meta.voc * sizeof(float);
+        char* logits_src = (char*)b_logits->data() + i * logits_bytes;
+        model->memcpyOnDevice(ctx->single_logits->data(), logits_src, logits_bytes);
+
+        if (use_greedy) {
+            ops::argmax(ctx->single_next_token, ctx->single_max_val, ctx->single_logits);
+        } else {
+            ops::sample(ctx->single_next_token, ctx->single_logits,
+                        temperature, top_k, top_p, model->rng_seed++);
+        }
+
+        int32_t host_token;
+        model->memcpyD2H(&host_token, ctx->single_next_token, sizeof(int32_t));
+        output_tokens[i] = host_token;
+
+        // 更新 slot position
+        ctx->slots[sid].current_pos++;
+    }
+}
+
+// ── 批量 Slot KV-Cache 保存/恢复 ────────────────────────────────
+
+static LlaisysQwen2CacheSnapshot* batch_slot_save_impl(
+    LlaisysQwen2BatchContext* ctx, size_t slot_id)
+{
+    auto* model = ctx->model;
+    auto& slot = ctx->slots[slot_id];
+    if (slot.current_pos <= 0) return nullptr;
+
+    auto* snap = new LlaisysQwen2CacheSnapshot();
+    snap->pos = slot.current_pos;
+    snap->nlayer = model->meta.nlayer;
+    snap->pos_bytes = model->local_nkvh * model->meta.dh * sizeof(float);
+    snap->tp_size = model->tp_size;
+    snap->tp_rank = model->tp_rank;
+    size_t total_bytes = snap->pos * snap->pos_bytes;
+    snap->buffers.resize(snap->nlayer * 2);
+
+    for (size_t i = 0; i < snap->nlayer; ++i) {
+        for (size_t kv = 0; kv < 2; ++kv) {
+            size_t idx = i * 2 + kv;
+            snap->buffers[idx].resize(total_bytes);
+            model->memcpyD2H(snap->buffers[idx].data(), slot.kv_caches[i][kv], total_bytes);
+        }
+    }
+    return snap;
+}
+
+static void batch_slot_restore_impl(
+    LlaisysQwen2BatchContext* ctx, size_t slot_id,
+    LlaisysQwen2CacheSnapshot* snapshot)
+{
+    if (!snapshot) return;
+    auto* model = ctx->model;
+    auto& slot = ctx->slots[slot_id];
+    if (snapshot->nlayer != model->meta.nlayer) return;
+    // TP 兼容性校验
+    if (snapshot->tp_size != model->tp_size || snapshot->tp_rank != model->tp_rank) {
+        std::cerr << "[qwen2] BatchSlotRestore: TP mismatch" << std::endl;
+        return;
+    }
+
+    slot.current_pos = snapshot->pos;
+    size_t total_bytes = snapshot->pos * snapshot->pos_bytes;
+
+    for (size_t i = 0; i < snapshot->nlayer; ++i) {
+        for (size_t kv = 0; kv < 2; ++kv) {
+            size_t idx = i * 2 + kv;
+            model->memcpyH2D(slot.kv_caches[i][kv], snapshot->buffers[idx].data(), total_bytes);
+        }
+    }
+    slot.active = true;
+}
+
+// ── C API for Batch Context ──────────────────────────────────────
+
+__export struct LlaisysQwen2BatchContext *llaisysQwen2BatchContextCreate(
+    struct LlaisysQwen2Model * model, size_t max_batch_size, size_t max_seq_per_slot)
+{
+    if (!model || max_batch_size == 0) return nullptr;
+    return new LlaisysQwen2BatchContext(model, max_batch_size, max_seq_per_slot);
+}
+
+__export void llaisysQwen2BatchContextDestroy(struct LlaisysQwen2BatchContext * ctx) {
+    if (ctx) delete ctx;
+}
+
+__export void llaisysQwen2BatchSlotReset(struct LlaisysQwen2BatchContext * ctx, size_t slot_id) {
+    if (!ctx || slot_id >= ctx->max_batch_size) return;
+    ctx->slots[slot_id].reset();
+}
+
+__export int64_t llaisysQwen2BatchPrefill(
+    struct LlaisysQwen2BatchContext * ctx,
+    size_t slot_id,
+    int64_t * token_ids, size_t ntoken,
+    float temperature, int top_k, float top_p)
+{
+    if (!ctx || slot_id >= ctx->max_batch_size || !token_ids || ntoken == 0) return -1;
+    ctx->slots[slot_id].reset();
+    return batch_prefill_impl(ctx, slot_id, token_ids, ntoken,
+                              temperature, top_k, top_p);
+}
+
+__export void llaisysQwen2BatchDecode(
+    struct LlaisysQwen2BatchContext * ctx,
+    size_t * active_slots, size_t num_active,
+    int64_t * current_tokens,
+    float temperature, int top_k, float top_p,
+    int64_t * output_tokens)
+{
+    if (!ctx || !active_slots || !current_tokens || !output_tokens || num_active == 0) return;
+    // 验证 slot IDs
+    for (size_t i = 0; i < num_active; ++i) {
+        if (active_slots[i] >= ctx->max_batch_size) return;
+    }
+    batch_decode_impl(ctx, active_slots, num_active, current_tokens,
+                      temperature, top_k, top_p, output_tokens);
+}
+
+__export int64_t llaisysQwen2BatchSlotGetPos(
+    struct LlaisysQwen2BatchContext * ctx, size_t slot_id)
+{
+    if (!ctx || slot_id >= ctx->max_batch_size) return 0;
+    return ctx->slots[slot_id].current_pos;
+}
+
+__export struct LlaisysQwen2CacheSnapshot *llaisysQwen2BatchSlotSave(
+    struct LlaisysQwen2BatchContext * ctx, size_t slot_id)
+{
+    if (!ctx || slot_id >= ctx->max_batch_size) return nullptr;
+    return batch_slot_save_impl(ctx, slot_id);
+}
+
+__export void llaisysQwen2BatchSlotRestore(
+    struct LlaisysQwen2BatchContext * ctx, size_t slot_id,
+    struct LlaisysQwen2CacheSnapshot * snapshot)
+{
+    if (!ctx || slot_id >= ctx->max_batch_size) return;
+    batch_slot_restore_impl(ctx, slot_id, snapshot);
 }
 
 } // extern "C"

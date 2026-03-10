@@ -4,6 +4,10 @@
 #include "nvidia/sample_nvidia.cuh"
 #endif
 
+#ifdef ENABLE_METAX_API
+#include "metax/sample_metax.hpp"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -114,6 +118,12 @@ void sample(tensor_t out_idx, tensor_t logits, float temperature, int top_k,
 #ifdef ENABLE_NVIDIA_API
     if (logits->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::sample(out_idx, logits, temperature, top_k, top_p, seed);
+    }
+#endif
+
+#ifdef ENABLE_METAX_API
+    if (logits->deviceType() == LLAISYS_DEVICE_METAX) {
+        return metax::sample(out_idx, logits, temperature, top_k, top_p, seed);
     }
 #endif
 
