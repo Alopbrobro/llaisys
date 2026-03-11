@@ -147,6 +147,18 @@ target("llaisys")
         add_cuflags("-Xcompiler=-fPIC")
         add_files("src/device/nvidia/*.cu")
         add_files("src/ops/*/nvidia/*.cu")
+        if has_config("dist-nccl") then
+            add_links("nccl")
+            add_includedirs("/usr/include")
+            add_files("src/distributed/nccl_comm.cu")
+        end
+    end
+
+    if has_config("dist-mpi") then
+        local mpi_prefix = os.getenv("MPI_HOME") or "/opt/hpcx/ompi"
+        add_includedirs(path.join(mpi_prefix, "include"))
+        add_linkdirs(path.join(mpi_prefix, "lib"))
+        add_links("mpi")
     end
 
     if has_config("metax-gpu") then

@@ -41,6 +41,15 @@ __C {
         llaisysTensor_t *mlp_gate_w_scale;
         llaisysTensor_t *mlp_up_w_scale;
         llaisysTensor_t *mlp_down_w_scale;
+
+        // AWQ 原生零点 (int32 packed, 仅 AWQ 原生路径使用)
+        llaisysTensor_t *attn_q_w_qzeros;
+        llaisysTensor_t *attn_k_w_qzeros;
+        llaisysTensor_t *attn_v_w_qzeros;
+        llaisysTensor_t *attn_o_w_qzeros;
+        llaisysTensor_t *mlp_gate_w_qzeros;
+        llaisysTensor_t *mlp_up_w_qzeros;
+        llaisysTensor_t *mlp_down_w_qzeros;
     };
 
     // 不透明的模型句柄

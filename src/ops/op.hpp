@@ -38,5 +38,9 @@ void dequantize(tensor_t out, tensor_t weight, tensor_t scale);
 // 10. Dequantize INT4 (packed uint8 → FP32, per-group symmetric)
 void dequantize_int4(tensor_t out, tensor_t weight, tensor_t scale, int group_size);
 
+// 11. Dequantize AWQ INT4 (packed int32 → FP32, per-group asymmetric, output-packed)
+//     out: [out_features, in_features] transposed for linear
+void dequantize_awq_int4(tensor_t out, tensor_t qweight, tensor_t qzeros, tensor_t scales, int group_size);
+
 } // namespace ops
 } // namespace llaisys

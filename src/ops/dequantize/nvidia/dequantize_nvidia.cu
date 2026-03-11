@@ -112,4 +112,76 @@ void dequantize_int4(tensor_t out, tensor_t weight, tensor_t scale, int group_si
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ─────────────────────────────────────────────
+// AWQ INT4 packed (int32) → FP32 (per-group asymmetric, output-packed)
+// ─────────────────────────────────────────────
+
+/// Each thread processes ONE int32 from qweight and writes EIGHT FP32 outputs.
+/// AWQ GEMM packing: output dimension is packed with interleaved bit order.
+///   qweight: [in_features, out_packed]  int32  (out_packed = out_features / 8)
+///   qzeros:  [num_groups, out_packed]   int32
+///   scales:  [num_groups, out_features] float32
+///   groups along in_features dimension: group_idx = in_idx / group_size
+///
+/// AWQ GEMM interleaved packing order: the 8 INT4 values within each int32 are
+/// stored at bit positions [0,16,4,20,8,24,12,28] corresponding to output
+/// column offsets [0,1,2,3,4,5,6,7] (element order [0,4,1,5,2,6,3,7]).
+///
+/// Output is TRANSPOSED: [out_features, in_features] for direct use in linear.
+__global__ void dequantize_awq_int4_f32_kernel(
+    float*         out,           // [out_features, in_features]
+    const int32_t* qweight,       // [in_features, out_packed]
+    const int32_t* qzeros,        // [num_groups, out_packed]
+    const float*   scales,        // [num_groups, out_features]
+    int64_t        in_features,
+    int64_t        out_features,
+    int64_t        out_packed,    // out_features / 8
+    int64_t        num_groups,
+    int            group_size)
+{
+    // AWQ GEMM interleaved bit shifts: output col i uses bit shift awq_shifts[i]
+    constexpr int awq_shifts[8] = {0, 16, 4, 20, 8, 24, 12, 28};
+
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = in_features * out_packed;
+    if (tid >= total) return;
+
+    int64_t in_idx = tid / out_packed;
+    int64_t pc     = tid % out_packed;
+    int64_t group  = in_idx / group_size;
+
+    int32_t packed_w = qweight[tid];
+    int32_t packed_z = qzeros[group * out_packed + pc];
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int val  = (packed_w >> awq_shifts[i]) & 0xF;
+        int zero = (packed_z >> awq_shifts[i]) & 0xF;
+        int64_t out_col = pc * 8 + i;
+        float s = scales[group * out_features + out_col];
+        // Write transposed: out[out_col][in_idx]
+        out[out_col * in_features + in_idx] = __int2float_rn(val - zero) * s;
+    }
+}
+
+void dequantize_awq_int4(tensor_t out, tensor_t qweight, tensor_t qzeros, tensor_t scales, int group_size) {
+    int64_t out_features = out->shape()[0];      // output rows (transposed)
+    int64_t in_features  = out->shape()[1];      // output cols (transposed)
+    int64_t out_packed   = qweight->shape()[1];  // out_features / 8
+    int64_t num_groups   = scales->shape()[0];
+    int64_t total        = in_features * out_packed;
+
+    const int threads = 256;
+    const int blocks  = (int)((total + threads - 1) / threads);
+
+    dequantize_awq_int4_f32_kernel<<<blocks, threads>>>(
+        reinterpret_cast<float*>(out->data()),
+        reinterpret_cast<const int32_t*>(qweight->data()),
+        reinterpret_cast<const int32_t*>(qzeros->data()),
+        reinterpret_cast<const float*>(scales->data()),
+        in_features, out_features, out_packed, num_groups, group_size);
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace llaisys::ops::nvidia

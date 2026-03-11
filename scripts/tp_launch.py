@@ -92,7 +92,10 @@ def _launch_subprocess(args):
             "--tp-rank", str(rank),
         ]
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(rank)  # 每个 rank 绑定一张卡
+        # TP 模式: 所有 rank 共享相同的 GPU 列表, device_id=tp_rank 选择对应 GPU
+        # (不能每个 rank 只看到 1 张卡, 否则 device_id=tp_rank > 0 时会失败)
+        gpu_list = ",".join(str(i) for i in range(args.tp_size))
+        env["CUDA_VISIBLE_DEVICES"] = env.get("CUDA_VISIBLE_DEVICES", gpu_list)
         
         print(f"  rank {rank}: port={port}, CUDA_VISIBLE_DEVICES={rank}")
         proc = subprocess.Popen(cmd, cwd=work_dir, env=env)

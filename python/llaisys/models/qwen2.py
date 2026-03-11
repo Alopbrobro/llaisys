@@ -55,7 +55,11 @@ from ..libllaisys.distributed import (
 
 from pathlib import Path
 import safetensors
+import safetensors.torch
 import os
+import hashlib
+import json as _json
+import time
 
 # =========================================================================
 # GPTQ/AWQ format constants
@@ -266,6 +270,122 @@ class Qwen2:
         print(f"[Qwen2] WARNING: {config_path} not found, using default config")
         return {}
 
+    # =====================================================================
+    # Conversion cache helpers
+    # =====================================================================
+
+    @staticmethod
+    def _cache_dir(model_path: Path) -> Path:
+        return model_path / ".llaisys_cache"
+
+    @staticmethod
+    def _compute_model_fingerprint(model_path: Path) -> str:
+        """Compute a fingerprint from original safetensors files (name + size)."""
+        h = hashlib.sha256()
+        for f in sorted(model_path.glob("*.safetensors")):
+            h.update(f.name.encode())
+            h.update(str(f.stat().st_size).encode())
+        # Also include config if present
+        cfg_path = model_path / "config.json"
+        if cfg_path.exists():
+            h.update(cfg_path.read_bytes())
+        return h.hexdigest()[:16]
+
+    def _try_load_from_cache(self, model_path: Path) -> bool:
+        """Try to load converted weights from cache. Returns True if successful."""
+        cache_dir = self._cache_dir(model_path)
+        meta_path = cache_dir / "cache_meta.json"
+        if not meta_path.exists():
+            return False
+
+        with open(meta_path) as f:
+            meta = _json.load(f)
+
+        # Validate fingerprint
+        current_fp = self._compute_model_fingerprint(model_path)
+        if meta.get("fingerprint") != current_fp:
+            print(f"[Cache] Fingerprint mismatch, cache invalidated")
+            return False
+
+        # Validate AWQ mode compatibility: native AWQ caches only non-quantized
+        # tensors, so such a cache is incomplete for FP16 conversion mode.
+        cached_awq_native = meta.get("awq_native", False)
+        if cached_awq_native:
+            print(f"[Cache] Cache was created in AWQ native mode (incomplete for FP16), skipping")
+            return False
+
+        cache_files = sorted(cache_dir.glob("weights_*.safetensors"))
+        if not cache_files:
+            return False
+
+        print(f"[Cache] Loading {len(cache_files)} cached file(s) from {cache_dir}")
+        t0 = time.time()
+
+        dtype_map = meta.get("dtype_map", {})
+        for cache_file in cache_files:
+            with safetensors.safe_open(cache_file, framework="pt", device="cpu") as sf:
+                for name in sf.keys():
+                    tensor = sf.get_tensor(name)
+                    dtype_enum = dtype_map.get(name, 13)  # default FP32
+                    self._call_load_weight(name, tensor, dtype_enum=dtype_enum)
+
+        elapsed = time.time() - t0
+        print(f"[Cache] Loaded in {elapsed:.1f}s (vs ~{meta.get('convert_time', '?')}s conversion)")
+        return True
+
+    @staticmethod
+    def _save_to_cache(model_path: Path, tensors: dict, dtype_map: dict, convert_time: float):
+        """Save converted tensors to cache directory.
+
+        Args:
+            model_path: Original model directory.
+            tensors: dict of {name: tensor} to cache.
+            dtype_map: dict of {name: dtype_enum} for each tensor.
+            convert_time: Time spent on conversion (for display).
+        """
+        cache_dir = Qwen2._cache_dir(model_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Split into chunks of ~2GB to avoid single huge files
+        MAX_SHARD_BYTES = 2 * 1024 * 1024 * 1024
+        shard_idx = 0
+        current_shard = {}
+        current_bytes = 0
+
+        sorted_names = sorted(tensors.keys())
+        for name in sorted_names:
+            t = tensors[name]
+            nbytes = t.nelement() * t.element_size()
+            if current_bytes > 0 and current_bytes + nbytes > MAX_SHARD_BYTES:
+                # Flush current shard
+                shard_path = cache_dir / f"weights_{shard_idx:04d}.safetensors"
+                safetensors.torch.save_file(current_shard, str(shard_path))
+                print(f"  [Cache] Saved shard {shard_path.name} ({current_bytes / 1024**3:.2f} GB)")
+                shard_idx += 1
+                current_shard = {}
+                current_bytes = 0
+            current_shard[name] = t
+            current_bytes += nbytes
+
+        if current_shard:
+            shard_path = cache_dir / f"weights_{shard_idx:04d}.safetensors"
+            safetensors.torch.save_file(current_shard, str(shard_path))
+            print(f"  [Cache] Saved shard {shard_path.name} ({current_bytes / 1024**3:.2f} GB)")
+
+        # Write metadata
+        fingerprint = Qwen2._compute_model_fingerprint(model_path)
+        meta = {
+            "fingerprint": fingerprint,
+            "convert_time": f"{convert_time:.1f}",
+            "num_shards": shard_idx + 1,
+            "num_tensors": len(tensors),
+            "dtype_map": dtype_map,
+        }
+        meta_path = cache_dir / "cache_meta.json"
+        with open(meta_path, "w") as f:
+            _json.dump(meta, f, indent=2)
+        print(f"  [Cache] Metadata saved to {meta_path}")
+
     def _get_dtype_enum(self, dtype_str):
         if "float32" in dtype_str: return 13
         if "float16" in dtype_str: return 12
@@ -298,7 +418,7 @@ class Qwen2:
 
     @staticmethod
     def _convert_gptq_layer(qweight, qzeros, scales, bits=4, group_size=128):
-        """Convert one GPTQ linear layer to our symmetric INT4 format.
+        """Convert one GPTQ linear layer to FP16 (no double quantization).
 
         GPTQ packing: input dimension is packed.
             qweight: [in_features // pack_factor, out_features] int32
@@ -306,8 +426,7 @@ class Qwen2:
             scales:  [num_groups, out_features] float16/float32
 
         Returns:
-            packed:  [out_features, in_features // 2] uint8 (our format)
-            scale:   [out_features, num_groups] float32 (our format)
+            weight_f16:  [out_features, in_features] float16
         """
         pack_factor = 32 // bits  # 8 for 4-bit
         mask = (1 << bits) - 1    # 0xF
@@ -316,41 +435,38 @@ class Qwen2:
         in_features = in_packed * pack_factor
         num_groups = scales.shape[0]
 
-        # --- Step 1: Unpack qweight [in_packed, out] → [in, out] ---
-        w_unpacked = torch.zeros(in_features, out_features, dtype=torch.int32)
-        for i in range(pack_factor):
-            w_unpacked[i::pack_factor, :] = (qweight >> (i * bits)) & mask
+        # --- Step 1: Unpack qweight [in_packed, out] → [in, out] (vectorized) ---
+        shifts = torch.arange(pack_factor, dtype=torch.int32) * bits  # [pack_factor]
+        # qweight: [in_packed, out] → [in_packed, 1, out] broadcast with shifts [pack_factor]
+        w_unpacked = ((qweight.unsqueeze(1) >> shifts.reshape(1, -1, 1)) & mask)  # [in_packed, pack_factor, out]
+        w_unpacked = w_unpacked.reshape(in_features, out_features)  # [in, out]
 
-        # --- Step 2: Unpack qzeros [ngroup, out_packed] → [ngroup, out] ---
-        z_unpacked = torch.zeros(num_groups, out_features, dtype=torch.int32)
-        for i in range(pack_factor):
-            z_unpacked[:, i::pack_factor] = (qzeros >> (i * bits)) & mask
+        # --- Step 2: Unpack qzeros [ngroup, out_packed] → [ngroup, out] (vectorized) ---
+        z_unpacked = ((qzeros.unsqueeze(-1) >> shifts) & mask)  # [ngroup, out_packed, pack_factor]
+        z_unpacked = z_unpacked.reshape(num_groups, out_features)  # [ngroup, out]
 
-        # --- Step 3: Dequantize to FP32 ---
+        # --- Step 3: Dequantize to FP32 (vectorized) ---
         # AutoGPTQ stores zero_point - 1, so we add 1 back
-        scales_f32 = scales.float()
-        w_float = torch.zeros(in_features, out_features, dtype=torch.float32)
-        for g in range(num_groups):
-            r_start = g * group_size
-            r_end = min(r_start + group_size, in_features)
-            w_slice = w_unpacked[r_start:r_end, :].float()
-            z_row = (z_unpacked[g, :].float() + 1.0).unsqueeze(0)  # +1 correction for GPTQ
-            s_row = scales_f32[g, :].unsqueeze(0)
-            w_float[r_start:r_end, :] = (w_slice - z_row) * s_row
+        w_grouped = w_unpacked.reshape(num_groups, group_size, out_features).float()
+        z_exp = (z_unpacked.float() + 1.0).unsqueeze(1)  # [ngroup, 1, out] (+1 GPTQ correction)
+        s_exp = scales.float().unsqueeze(1)               # [ngroup, 1, out]
+        w_float = ((w_grouped - z_exp) * s_exp).reshape(in_features, out_features)
 
-        # --- Step 4: Transpose to our [out, in] layout & re-quantize ---
-        w_float = w_float.T.contiguous()  # [out_features, in_features]
-        return Qwen2._requantize_to_int4(w_float, group_size)
+        # --- Step 4: Transpose to our [out, in] layout & convert to FP16 ---
+        return w_float.T.contiguous().to(torch.float16)
 
     @staticmethod
     def _convert_awq_layer(qweight, qzeros, scales, bits=4, group_size=128):
         """Convert one AWQ GEMM format linear layer to FP16 (no double quantization).
 
-        AWQ GEMM packing: output dimension is packed.
+        AWQ GEMM packing: output dimension is packed with interleaved bit order.
             qweight: [in_features, out_features // pack_factor] int32
             qzeros:  [num_groups, out_features // pack_factor] int32
             scales:  [num_groups, out_features] float16/float32
-        Groups are along the in_features dimension.
+
+        AWQ GEMM uses interleaved packing order [0,4,1,5,2,6,3,7] for the 8
+        INT4 values within each int32, corresponding to bit shifts
+        [0, 16, 4, 20, 8, 24, 12, 28].
 
         Returns:
             weight_f16:  [out_features, in_features] float16
@@ -362,31 +478,25 @@ class Qwen2:
         out_features = out_packed * pack_factor
         num_groups = scales.shape[0]
 
-        # --- Step 1: Unpack qweight [in, out_packed] → [in, out] ---
-        w_unpacked = torch.zeros(in_features, out_features, dtype=torch.int32)
-        for i in range(pack_factor):
-            w_unpacked[:, i::pack_factor] = (qweight >> (i * bits)) & mask
+        # AWQ GEMM interleaved bit shifts: element order [0,4,1,5,2,6,3,7]
+        shifts = torch.tensor([0, 16, 4, 20, 8, 24, 12, 28], dtype=torch.int32)
 
-        # --- Step 2: Unpack qzeros [ngroup, out_packed] → [ngroup, out] ---
-        z_unpacked = torch.zeros(num_groups, out_features, dtype=torch.int32)
-        for i in range(pack_factor):
-            z_unpacked[:, i::pack_factor] = (qzeros >> (i * bits)) & mask
+        # --- Step 1: Unpack qweight [in, out_packed] → [in, out] (vectorized) ---
+        w_unpacked = ((qweight.unsqueeze(-1) >> shifts) & mask)  # [in, out_packed, pack_factor]
+        w_unpacked = w_unpacked.reshape(in_features, out_features)  # [in, out]
 
-        # --- Step 3: Dequantize to FP32 ---
-        # AWQ: w_float = (w_uint4 - zero_point) * scale  (no +1 correction)
-        scales_f32 = scales.float()
-        w_float = torch.zeros(in_features, out_features, dtype=torch.float32)
-        for g in range(num_groups):
-            r_start = g * group_size
-            r_end = min(r_start + group_size, in_features)
-            w_slice = w_unpacked[r_start:r_end, :].float()
-            z_row = z_unpacked[g, :].float().unsqueeze(0)  # no +1 for AWQ
-            s_row = scales_f32[g, :].unsqueeze(0)
-            w_float[r_start:r_end, :] = (w_slice - z_row) * s_row
+        # --- Step 2: Unpack qzeros [ngroup, out_packed] → [ngroup, out] (vectorized) ---
+        z_unpacked = ((qzeros.unsqueeze(-1) >> shifts) & mask)  # [ngroup, out_packed, pack_factor]
+        z_unpacked = z_unpacked.reshape(num_groups, out_features)  # [ngroup, out]
+
+        # --- Step 3: Dequantize to FP32 (fully vectorized, no Python loop) ---
+        w_grouped = w_unpacked.reshape(num_groups, group_size, out_features).float()
+        z_exp = z_unpacked.float().unsqueeze(1)       # [ngroup, 1, out]
+        s_exp = scales.float().unsqueeze(1)            # [ngroup, 1, out]
+        w_float = ((w_grouped - z_exp) * s_exp).reshape(in_features, out_features)
 
         # --- Step 4: Transpose to our [out, in] layout & convert to FP16 ---
-        w_float = w_float.T.contiguous()  # [out_features, in_features]
-        return w_float.to(torch.float16)
+        return w_float.T.contiguous().to(torch.float16)
 
     @staticmethod
     def _requantize_to_int4(w_float, group_size):
@@ -507,6 +617,9 @@ class Qwen2:
     def _load_weights_gptq(self, model_path, bits=4, group_size=128, quant_method="gptq"):
         """Load GPTQ/AWQ format model, converting to our symmetric INT4 at load time.
 
+        Supports conversion result caching: first load converts and saves to
+        .llaisys_cache/, subsequent loads read directly from cache.
+
         GPTQ packing (input packed):
           .qweight → [in_features // 8, out_features] int32
         AWQ GEMM packing (output packed):
@@ -519,6 +632,17 @@ class Qwen2:
         Non-linear tensors (embed, norm, bias) are loaded as FP32.
         """
         is_awq = (quant_method == "awq")
+        # Native AWQ kernel: pass raw I32 data to C++ GPU kernel instead of CPU→FP16 conversion.
+        # Set LLAISYS_AWQ_NATIVE=0 to fall back to CPU FP16 conversion.
+        import os
+        use_native_awq = is_awq and os.environ.get("LLAISYS_AWQ_NATIVE", "1") != "0"
+
+        # ─── Try loading from cache first (only for CPU conversion mode) ───
+        if not use_native_awq and self._try_load_from_cache(model_path):
+            print(f"  [Cache] Successfully loaded from cache, skipping conversion")
+            return
+
+        t_convert_start = time.time()
         convert_fn = self._convert_awq_layer if is_awq else self._convert_gptq_layer
         files = sorted(list(model_path.glob("*.safetensors")))
         if not files:
@@ -534,6 +658,8 @@ class Qwen2:
 
         processed = set()
         converted_count = 0
+        cache_tensors = {}   # {name: tensor} for cache saving
+        cache_dtypes = {}    # {name: dtype_enum}
 
         for name in sorted(all_tensors.keys()):
             if name in processed:
@@ -555,21 +681,39 @@ class Qwen2:
                 weight_name = base + ".weight"
 
                 if is_awq:
-                    # AWQ → FP16 dequantized weight (no double quantization)
+                    if use_native_awq:
+                        # Native AWQ: pass raw packed I32 qweight + qzeros + FP32 scales to C++
+                        # C++ kernel will dequantize on GPU at inference time.
+                        # C++ LoadWeightByName handles TP slicing for AWQ layout
+                        # (inverts ColDim0↔RowDim1 since AWQ is [in, out_packed]).
+                        qw_i32 = qweight.to(torch.int32).contiguous()
+                        qz_i32 = qzeros.to(torch.int32).contiguous()
+                        sc_f32 = scales.to(torch.float32).contiguous()
+
+                        self._call_load_weight(weight_name, qw_i32, dtype_enum=5)  # I32
+                        self._call_load_weight(weight_name + ".qzeros", qz_i32, dtype_enum=5)  # I32
+                        self._call_load_weight(weight_name + ".scale", sc_f32, dtype_enum=13)  # F32
+                        vram_mb = (qw_i32.nelement() + qz_i32.nelement()) * 4 / (1024 * 1024)
+                        tag = "AWQ-native"
+                        print(f"  [{tag}] {weight_name}: qweight{list(qw_i32.shape)} + qzeros{list(qz_i32.shape)} + scales{list(sc_f32.shape)} ({vram_mb:.0f} MB)")
+                    else:
+                        # AWQ → FP16 dequantized weight (CPU conversion, no double quantization)
+                        w_f16 = convert_fn(qweight, qzeros, scales, bits=bits, group_size=group_size)
+                        self._call_load_weight(weight_name, w_f16, dtype_enum=12)  # FP16
+                        cache_tensors[weight_name] = w_f16
+                        cache_dtypes[weight_name] = 12
+                        vram_mb = w_f16.nelement() * 2 / (1024 * 1024)
+                        tag = "AWQ→FP16"
+                        print(f"  [{tag}] {weight_name}: {list(w_f16.shape)} ({vram_mb:.0f} MB)")
+                else:
+                    # GPTQ → FP16 dequantized weight (no double quantization)
                     w_f16 = convert_fn(qweight, qzeros, scales, bits=bits, group_size=group_size)
                     self._call_load_weight(weight_name, w_f16, dtype_enum=12)  # FP16
+                    cache_tensors[weight_name] = w_f16
+                    cache_dtypes[weight_name] = 12
                     vram_mb = w_f16.nelement() * 2 / (1024 * 1024)
-                    tag = "AWQ→FP16"
+                    tag = "GPTQ→FP16"
                     print(f"  [{tag}] {weight_name}: {list(w_f16.shape)} ({vram_mb:.0f} MB)")
-                else:
-                    # GPTQ → our symmetric INT4
-                    packed, our_scale = convert_fn(
-                        qweight, qzeros, scales, bits=bits, group_size=group_size)
-                    scale_name = base + ".weight.scale"
-                    self._call_load_weight(weight_name, packed, dtype_enum=7)   # U8
-                    self._call_load_weight(scale_name, our_scale, dtype_enum=13) # FP32
-                    tag = "GPTQ→INT4"
-                    print(f"  [{tag}] {weight_name}: {list(packed.shape)} + scale {list(our_scale.shape)}")
 
                 processed.update([name, base + ".qzeros", base + ".scales"])
                 if base + ".g_idx" in all_tensors:
@@ -580,6 +724,8 @@ class Qwen2:
                     if bias.dtype != torch.float32:
                         bias = bias.to(torch.float32)
                     self._call_load_weight(base + ".bias", bias, dtype_enum=13)
+                    cache_tensors[base + ".bias"] = bias
+                    cache_dtypes[base + ".bias"] = 13
                     processed.add(base + ".bias")
 
                 converted_count += 1
@@ -604,6 +750,8 @@ class Qwen2:
                     if tensor.dtype != torch.float16:
                         tensor = tensor.to(torch.float16)
                     self._call_load_weight(name, tensor, dtype_enum=12)  # FP16
+                    cache_tensors[name] = tensor
+                    cache_dtypes[name] = 12
                     processed.add(name)
                     vram_mb = tensor.nelement() * 2 / (1024 * 1024)
                     print(f"  [FP16]  {name}: {list(tensor.shape)} → float16 ({vram_mb:.0f} MB)")
@@ -611,10 +759,21 @@ class Qwen2:
                     if tensor.dtype != torch.float32:
                         tensor = tensor.to(torch.float32)
                     self._call_load_weight(name, tensor, dtype_enum=13)  # FP32
+                    cache_tensors[name] = tensor
+                    cache_dtypes[name] = 13
                     processed.add(name)
                     print(f"  [KEEP]  {name}: {list(tensor.shape)} → float32")
 
-        print(f"  Converted {converted_count} GPTQ layers to symmetric INT4")
+        convert_time = time.time() - t_convert_start
+        print(f"  Converted {converted_count} {quant_method.upper()} layers ({convert_time:.1f}s)")
+
+        # ─── Save to cache for next time (only FP16 conversion mode) ───
+        if not use_native_awq:
+            try:
+                self._save_to_cache(model_path, cache_tensors, cache_dtypes, convert_time)
+                print(f"  [Cache] Conversion results cached — next load will be ~10× faster")
+            except Exception as e:
+                print(f"  [Cache] WARNING: Failed to save cache: {e}")
 
     def generate(
         self,

@@ -90,3 +90,16 @@ ehthumbs.db
 desktop.ini
 quantized_model/
 quantized_model_int4/
+
+# Model weights
+*.safetensors
+*.bin
+.llaisys_cache/
+
+# Profiling reports
+*.ncu-rep
+*.nsys-rep
+
+# Temp files
+nohup.out
+test_awq_native.py

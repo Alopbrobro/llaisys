@@ -4,6 +4,7 @@
 #include "../../ops/dequantize/op.hpp"
 #include "../../utils/types.hpp"
 #include "../../distributed/comm.hpp"   
+#include <algorithm>
 #include <vector>
 #include <iostream>
 #include <cstring>
@@ -86,6 +87,9 @@ struct LlaisysQwen2Model {
 
     // INT8 量化标记
     bool has_quantized = false;
+
+    // AWQ 原生模式标记 (I32 packed qweight 已加载)
+    bool has_awq_native = false;
 
     // Dequantize 临时缓冲区 (按需分配)
     // key = (rows << 32) | cols, value = FP32 buffer
@@ -193,6 +197,15 @@ struct LlaisysQwen2Model {
         weights.mlp_up_w_scale = new llaisysTensor_t[meta.nlayer]();
         weights.mlp_down_w_scale = new llaisysTensor_t[meta.nlayer]();
 
+        // AWQ 零点数组
+        weights.attn_q_w_qzeros = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_k_w_qzeros = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_v_w_qzeros = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_o_w_qzeros = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_gate_w_qzeros = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_up_w_qzeros = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_down_w_qzeros = new llaisysTensor_t[meta.nlayer]();
+
         init_cache();
         init_buffers();
     }
@@ -259,14 +272,36 @@ struct LlaisysQwen2Model {
         return buf;
     }
 
-    // 量化感知的 linear 调用: 如果 weight 是 INT8/INT4 则先 dequantize
+    // 量化感知的 linear 调用: 如果 weight 是 INT8/INT4/AWQ-I32 则先 dequantize
     void linear_maybe_dequant(tensor_t out, tensor_t in,
                               llaisysTensor_t w_handle, llaisysTensor_t scale_handle,
-                              llaisysTensor_t bias_handle) {
+                              llaisysTensor_t bias_handle,
+                              llaisysTensor_t qzeros_handle = nullptr) {
         auto w = TO_CPP_TENSOR(w_handle);
+        if (!w) {
+            fprintf(stderr, "[ERROR] linear_maybe_dequant: weight is NULL\n");
+            return;
+        }
         auto b = TO_CPP_TENSOR(bias_handle);
 
-        if (w->dtype() == LLAISYS_DTYPE_I8 && scale_handle) {
+        if (w->dtype() == LLAISYS_DTYPE_I32 && scale_handle && qzeros_handle) {
+            // AWQ 原生路径: int32 packed → dequantize_awq_int4 → FP32 → linear
+            auto sc = TO_CPP_TENSOR(scale_handle);
+            auto qz = TO_CPP_TENSOR(qzeros_handle);
+            if (!sc || !qz) {
+                fprintf(stderr, "[AWQ] ERROR: sc or qz null despite non-null handles\n");
+                return;
+            }
+            // qweight: [in_features, out_packed], out is [out_features, in_features]
+            size_t in_features = w->shape()[0];
+            size_t out_packed  = w->shape()[1];
+            size_t out_features = out_packed * 8;
+            size_t num_groups = sc->shape()[0];
+            int group_size = (int)(in_features / num_groups);
+            auto dq_buf = get_dequant_buf(out_features, in_features);
+            ops::dequantize_awq_int4(dq_buf, w, qz, sc, group_size);
+            ops::linear(out, in, dq_buf, b);
+        } else if (w->dtype() == LLAISYS_DTYPE_I8 && scale_handle) {
             // INT8 路径: dequantize → FP32 → linear
             auto sc = TO_CPP_TENSOR(scale_handle);
             size_t rows = w->shape()[0];
@@ -304,18 +339,18 @@ enum class TpSlice { None, ColDim0, RowDim1 };
 static TpSlice classifyWeight(const std::string& suffix) {
     // Column Parallel (按 out_features / dim 0 切分)
     if (suffix == "self_attn.q_proj.weight" || suffix == "self_attn.q_proj.bias" ||
-        suffix == "self_attn.q_proj.weight.scale" ||
+        suffix == "self_attn.q_proj.weight.scale" || suffix == "self_attn.q_proj.weight.qzeros" ||
         suffix == "self_attn.k_proj.weight" || suffix == "self_attn.k_proj.bias" ||
-        suffix == "self_attn.k_proj.weight.scale" ||
+        suffix == "self_attn.k_proj.weight.scale" || suffix == "self_attn.k_proj.weight.qzeros" ||
         suffix == "self_attn.v_proj.weight" || suffix == "self_attn.v_proj.bias" ||
-        suffix == "self_attn.v_proj.weight.scale" ||
-        suffix == "mlp.gate_proj.weight" || suffix == "mlp.gate_proj.weight.scale" ||
-        suffix == "mlp.up_proj.weight" || suffix == "mlp.up_proj.weight.scale") {
+        suffix == "self_attn.v_proj.weight.scale" || suffix == "self_attn.v_proj.weight.qzeros" ||
+        suffix == "mlp.gate_proj.weight" || suffix == "mlp.gate_proj.weight.scale" || suffix == "mlp.gate_proj.weight.qzeros" ||
+        suffix == "mlp.up_proj.weight" || suffix == "mlp.up_proj.weight.scale" || suffix == "mlp.up_proj.weight.qzeros") {
         return TpSlice::ColDim0;
     }
     // Row Parallel (按 in_features / dim 1 切分)
-    if (suffix == "self_attn.o_proj.weight" ||
-        suffix == "mlp.down_proj.weight") {
+    if (suffix == "self_attn.o_proj.weight" || suffix == "self_attn.o_proj.weight.qzeros" ||
+        suffix == "mlp.down_proj.weight" || suffix == "mlp.down_proj.weight.qzeros") {
         return TpSlice::RowDim1;
     }
     // 不切分：embedding, norm, lm_head, row-parallel 的 scale
@@ -443,9 +478,9 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.attn_norm_w[i]), model->meta.epsilon);
 
             // B. QKV Linear
-            model->linear_maybe_dequant(model->q, model->norm_out, model->weights.attn_q_w[i], model->weights.attn_q_w_scale[i], model->weights.attn_q_b[i]);
-            model->linear_maybe_dequant(model->k, model->norm_out, model->weights.attn_k_w[i], model->weights.attn_k_w_scale[i], model->weights.attn_k_b[i]);
-            model->linear_maybe_dequant(model->v, model->norm_out, model->weights.attn_v_w[i], model->weights.attn_v_w_scale[i], model->weights.attn_v_b[i]);
+            model->linear_maybe_dequant(model->q, model->norm_out, model->weights.attn_q_w[i], model->weights.attn_q_w_scale[i], model->weights.attn_q_b[i], model->weights.attn_q_w_qzeros[i]);
+            model->linear_maybe_dequant(model->k, model->norm_out, model->weights.attn_k_w[i], model->weights.attn_k_w_scale[i], model->weights.attn_k_b[i], model->weights.attn_k_w_qzeros[i]);
+            model->linear_maybe_dequant(model->v, model->norm_out, model->weights.attn_v_w[i], model->weights.attn_v_w_scale[i], model->weights.attn_v_b[i], model->weights.attn_v_w_qzeros[i]);
 
             // C. RoPE
             auto q_3d = model->q->reshape({1, model->local_nh, model->meta.dh});
@@ -473,7 +508,7 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
 
             // F. Output Projection (TP: attn_out 是 local head 视图)
             auto attn_flat = model->attn_out->reshape({1, model->local_nh * model->meta.dh});
-            model->linear_maybe_dequant(model->hidden_states, attn_flat, model->weights.attn_o_w[i], model->weights.attn_o_w_scale[i], nullptr);
+            model->linear_maybe_dequant(model->hidden_states, attn_flat, model->weights.attn_o_w[i], model->weights.attn_o_w_scale[i], nullptr, model->weights.attn_o_w_qzeros[i]);
 
             // TP: O proj 是 row parallel, 需要 all-reduce
             model->allReduceIfTP(model->hidden_states, model->meta.hs);
@@ -485,12 +520,12 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
             std::swap(model->residual, model->hidden_states);
             ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.mlp_norm_w[i]), model->meta.epsilon);
 
-            model->linear_maybe_dequant(model->gate, model->norm_out, model->weights.mlp_gate_w[i], model->weights.mlp_gate_w_scale[i], nullptr);
-            model->linear_maybe_dequant(model->up, model->norm_out, model->weights.mlp_up_w[i], model->weights.mlp_up_w_scale[i], nullptr);
+            model->linear_maybe_dequant(model->gate, model->norm_out, model->weights.mlp_gate_w[i], model->weights.mlp_gate_w_scale[i], nullptr, model->weights.mlp_gate_w_qzeros[i]);
+            model->linear_maybe_dequant(model->up, model->norm_out, model->weights.mlp_up_w[i], model->weights.mlp_up_w_scale[i], nullptr, model->weights.mlp_up_w_qzeros[i]);
             
             ops::swiglu(model->mlp_act, model->gate, model->up);
             
-            model->linear_maybe_dequant(model->hidden_states, model->mlp_act, model->weights.mlp_down_w[i], model->weights.mlp_down_w_scale[i], nullptr);
+            model->linear_maybe_dequant(model->hidden_states, model->mlp_act, model->weights.mlp_down_w[i], model->weights.mlp_down_w_scale[i], nullptr, model->weights.mlp_down_w_qzeros[i]);
 
             // TP: down proj 是 row parallel, 需要 all-reduce
             model->allReduceIfTP(model->hidden_states, model->meta.hs);
@@ -545,9 +580,9 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
             std::swap(model->residual, model->hidden_states);
             ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.attn_norm_w[i]), model->meta.epsilon);
 
-            model->linear_maybe_dequant(model->q, model->norm_out, model->weights.attn_q_w[i], model->weights.attn_q_w_scale[i], model->weights.attn_q_b[i]);
-            model->linear_maybe_dequant(model->k, model->norm_out, model->weights.attn_k_w[i], model->weights.attn_k_w_scale[i], model->weights.attn_k_b[i]);
-            model->linear_maybe_dequant(model->v, model->norm_out, model->weights.attn_v_w[i], model->weights.attn_v_w_scale[i], model->weights.attn_v_b[i]);
+            model->linear_maybe_dequant(model->q, model->norm_out, model->weights.attn_q_w[i], model->weights.attn_q_w_scale[i], model->weights.attn_q_b[i], model->weights.attn_q_w_qzeros[i]);
+            model->linear_maybe_dequant(model->k, model->norm_out, model->weights.attn_k_w[i], model->weights.attn_k_w_scale[i], model->weights.attn_k_b[i], model->weights.attn_k_w_qzeros[i]);
+            model->linear_maybe_dequant(model->v, model->norm_out, model->weights.attn_v_w[i], model->weights.attn_v_w_scale[i], model->weights.attn_v_b[i], model->weights.attn_v_w_qzeros[i]);
 
             auto q_3d = model->q->reshape({1, model->local_nh, model->meta.dh});
             auto k_3d = model->k->reshape({1, model->local_nkvh, model->meta.dh});
@@ -572,17 +607,17 @@ __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, 
             ops::self_attention(model->attn_out, q_3d, k_slice, v_slice, scale);
 
             auto attn_flat = model->attn_out->reshape({1, model->local_nh * model->meta.dh});
-            model->linear_maybe_dequant(model->hidden_states, attn_flat, model->weights.attn_o_w[i], model->weights.attn_o_w_scale[i], nullptr);
+            model->linear_maybe_dequant(model->hidden_states, attn_flat, model->weights.attn_o_w[i], model->weights.attn_o_w_scale[i], nullptr, model->weights.attn_o_w_qzeros[i]);
             // TP: O proj row parallel → all-reduce
             model->allReduceIfTP(model->hidden_states, model->meta.hs);
             ops::add(model->hidden_states, model->hidden_states, model->residual);
 
             std::swap(model->residual, model->hidden_states);
             ops::rms_norm(model->norm_out, model->residual, TO_CPP_TENSOR(model->weights.mlp_norm_w[i]), model->meta.epsilon);
-            model->linear_maybe_dequant(model->gate, model->norm_out, model->weights.mlp_gate_w[i], model->weights.mlp_gate_w_scale[i], nullptr);
-            model->linear_maybe_dequant(model->up, model->norm_out, model->weights.mlp_up_w[i], model->weights.mlp_up_w_scale[i], nullptr);
+            model->linear_maybe_dequant(model->gate, model->norm_out, model->weights.mlp_gate_w[i], model->weights.mlp_gate_w_scale[i], nullptr, model->weights.mlp_gate_w_qzeros[i]);
+            model->linear_maybe_dequant(model->up, model->norm_out, model->weights.mlp_up_w[i], model->weights.mlp_up_w_scale[i], nullptr, model->weights.mlp_up_w_qzeros[i]);
             ops::swiglu(model->mlp_act, model->gate, model->up);
-            model->linear_maybe_dequant(model->hidden_states, model->mlp_act, model->weights.mlp_down_w[i], model->weights.mlp_down_w_scale[i], nullptr);
+            model->linear_maybe_dequant(model->hidden_states, model->mlp_act, model->weights.mlp_down_w[i], model->weights.mlp_down_w_scale[i], nullptr, model->weights.mlp_down_w_qzeros[i]);
             // TP: down proj row parallel → all-reduce
             model->allReduceIfTP(model->hidden_states, model->meta.hs);
             ops::add(model->hidden_states, model->hidden_states, model->residual);
@@ -634,6 +669,13 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
     std::string key(name);
     size_t elem_size = llaisys::utils::dsize((llaisysDataType_t)dtype);
 
+    // AWQ: qweight loaded as I32 with .weight suffix → mark as AWQ native quantized
+    if ((llaisysDataType_t)dtype == LLAISYS_DTYPE_I32 &&
+        key.size() > 7 && key.substr(key.size() - 7) == ".weight") {
+        model->has_quantized = true;
+        model->has_awq_native = true;
+    }
+
     // ── 判断 TP 切分策略 ──
     TpSlice how = TpSlice::None;
     if (model->tp_size > 1) {
@@ -643,6 +685,23 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
             size_t second_dot = key.find('.', first_dot);
             std::string suffix = key.substr(second_dot + 1);
             how = classifyWeight(suffix);
+
+            // AWQ native mode: tensor layouts are transposed vs standard convention.
+            // qweight/qzeros: [in, out_packed], scales: [ngroups, out]
+            // Standard:       [out, in],        scales: [out, ngroups]
+            // → invert ColDim0 ↔ RowDim1 for all AWQ tensors (.weight, .qzeros, .scale)
+            if (model->has_awq_native && how != TpSlice::None &&
+                (suffix.find(".weight") != std::string::npos)) {
+                how = (how == TpSlice::ColDim0) ? TpSlice::RowDim1 : TpSlice::ColDim0;
+            }
+            // AWQ row-parallel scales: non-AWQ leaves these as None since out_features
+            // isn't split, but AWQ scales are [ngroups, out_features] and groups (along
+            // in_features) must be split for row-parallel projections.
+            if (model->has_awq_native && how == TpSlice::None &&
+                (suffix == "self_attn.o_proj.weight.scale" ||
+                 suffix == "mlp.down_proj.weight.scale")) {
+                how = TpSlice::ColDim0;  // slice dim0 (ngroups)
+            }
         }
         // 顶层权重 (embed, norm, lm_head) → TpSlice::None (不切分，全量复制)
     }
@@ -715,6 +774,14 @@ __export void llaisysQwen2LoadWeightByName(struct LlaisysQwen2Model* model, cons
         else if (suffix == "mlp.gate_proj.weight.scale") model->weights.mlp_gate_w_scale[layer_idx] = t_handle;
         else if (suffix == "mlp.up_proj.weight.scale") model->weights.mlp_up_w_scale[layer_idx] = t_handle;
         else if (suffix == "mlp.down_proj.weight.scale") model->weights.mlp_down_w_scale[layer_idx] = t_handle;
+        // AWQ qzeros
+        else if (suffix == "self_attn.q_proj.weight.qzeros") model->weights.attn_q_w_qzeros[layer_idx] = t_handle;
+        else if (suffix == "self_attn.k_proj.weight.qzeros") model->weights.attn_k_w_qzeros[layer_idx] = t_handle;
+        else if (suffix == "self_attn.v_proj.weight.qzeros") model->weights.attn_v_w_qzeros[layer_idx] = t_handle;
+        else if (suffix == "self_attn.o_proj.weight.qzeros") model->weights.attn_o_w_qzeros[layer_idx] = t_handle;
+        else if (suffix == "mlp.gate_proj.weight.qzeros") model->weights.mlp_gate_w_qzeros[layer_idx] = t_handle;
+        else if (suffix == "mlp.up_proj.weight.qzeros") model->weights.mlp_up_w_qzeros[layer_idx] = t_handle;
+        else if (suffix == "mlp.down_proj.weight.qzeros") model->weights.mlp_down_w_qzeros[layer_idx] = t_handle;
     }
 }
 
@@ -956,8 +1023,9 @@ struct LlaisysQwen2BatchContext {
     // 量化感知 linear (复用 model 的 dequant cache)
     void linear_maybe_dequant(tensor_t out, tensor_t in,
                               llaisysTensor_t w_handle, llaisysTensor_t scale_handle,
-                              llaisysTensor_t bias_handle) {
-        model->linear_maybe_dequant(out, in, w_handle, scale_handle, bias_handle);
+                              llaisysTensor_t bias_handle,
+                              llaisysTensor_t qzeros_handle = nullptr) {
+        model->linear_maybe_dequant(out, in, w_handle, scale_handle, bias_handle, qzeros_handle);
     }
 };
 
@@ -1057,13 +1125,13 @@ static void batch_decode_impl(LlaisysQwen2BatchContext* ctx,
         // B. QKV Linear (batch)
         ctx->linear_maybe_dequant(b_q, b_norm,
             model->weights.attn_q_w[layer], model->weights.attn_q_w_scale[layer],
-            model->weights.attn_q_b[layer]);
+            model->weights.attn_q_b[layer], model->weights.attn_q_w_qzeros[layer]);
         ctx->linear_maybe_dequant(b_k, b_norm,
             model->weights.attn_k_w[layer], model->weights.attn_k_w_scale[layer],
-            model->weights.attn_k_b[layer]);
+            model->weights.attn_k_b[layer], model->weights.attn_k_w_qzeros[layer]);
         ctx->linear_maybe_dequant(b_v, b_norm,
             model->weights.attn_v_w[layer], model->weights.attn_v_w_scale[layer],
-            model->weights.attn_v_b[layer]);
+            model->weights.attn_v_b[layer], model->weights.attn_v_w_qzeros[layer]);
 
         // C. RoPE (batch): reshape [B, nh*dh] → [B, nh, dh], pos_ids = [B]
         auto q_3d = b_q->reshape({B, model->local_nh, meta.dh});
@@ -1110,7 +1178,7 @@ static void batch_decode_impl(LlaisysQwen2BatchContext* ctx,
         // E. O Projection (batch)
         ctx->linear_maybe_dequant(b_hidden, b_attn,
             model->weights.attn_o_w[layer], model->weights.attn_o_w_scale[layer],
-            nullptr);
+            nullptr, model->weights.attn_o_w_qzeros[layer]);
         // TP: O proj row parallel → all-reduce
         model->allReduceIfTP(b_hidden, B * meta.hs);
 
@@ -1125,14 +1193,14 @@ static void batch_decode_impl(LlaisysQwen2BatchContext* ctx,
 
         ctx->linear_maybe_dequant(b_gate, b_norm,
             model->weights.mlp_gate_w[layer], model->weights.mlp_gate_w_scale[layer],
-            nullptr);
+            nullptr, model->weights.mlp_gate_w_qzeros[layer]);
         ctx->linear_maybe_dequant(b_up, b_norm,
             model->weights.mlp_up_w[layer], model->weights.mlp_up_w_scale[layer],
-            nullptr);
+            nullptr, model->weights.mlp_up_w_qzeros[layer]);
         ops::swiglu(b_mlp, b_gate, b_up);
         ctx->linear_maybe_dequant(b_hidden, b_mlp,
             model->weights.mlp_down_w[layer], model->weights.mlp_down_w_scale[layer],
-            nullptr);
+            nullptr, model->weights.mlp_down_w_qzeros[layer]);
         // TP: down proj row parallel → all-reduce
         model->allReduceIfTP(b_hidden, B * meta.hs);
 

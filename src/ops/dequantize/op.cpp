@@ -113,4 +113,58 @@ void dequantize_int4(tensor_t out, tensor_t weight, tensor_t scale, int group_si
     dequantize_int4_cpu(out, weight, scale, group_size);
 }
 
+// ─────────────────────────────────────────────
+// AWQ INT4 packed (int32) → FP32, per-group asymmetric, output-packed
+// ─────────────────────────────────────────────
+
+static void dequantize_awq_int4_cpu(tensor_t out, tensor_t qweight, tensor_t qzeros, tensor_t scales, int group_size) {
+    float*         out_ptr = reinterpret_cast<float*>(out->data());
+    const int32_t* w_ptr   = reinterpret_cast<const int32_t*>(qweight->data());
+    const int32_t* z_ptr   = reinterpret_cast<const int32_t*>(qzeros->data());
+    const float*   s_ptr   = reinterpret_cast<const float*>(scales->data());
+
+    int64_t out_features = out->shape()[0];       // transposed output rows
+    int64_t in_features  = out->shape()[1];       // transposed output cols
+    int64_t out_packed   = qweight->shape()[1];   // out_features / 8
+
+    // AWQ GEMM interleaved bit shifts for output columns 0..7
+    static const int awq_shifts[8] = {0, 16, 4, 20, 8, 24, 12, 28};
+
+    for (int64_t in_idx = 0; in_idx < in_features; ++in_idx) {
+        int64_t group = in_idx / group_size;
+        for (int64_t pc = 0; pc < out_packed; ++pc) {
+            int32_t packed_w = w_ptr[in_idx * out_packed + pc];
+            int32_t packed_z = z_ptr[group * out_packed + pc];
+            for (int i = 0; i < 8; ++i) {
+                int val  = (packed_w >> awq_shifts[i]) & 0xF;
+                int zero = (packed_z >> awq_shifts[i]) & 0xF;
+                int64_t out_col = pc * 8 + i;
+                float s = s_ptr[group * out_features + out_col];
+                // Write transposed: out[out_col][in_idx]
+                out_ptr[out_col * in_features + in_idx] = (float)(val - zero) * s;
+            }
+        }
+    }
+}
+
+void dequantize_awq_int4(tensor_t out, tensor_t qweight, tensor_t qzeros, tensor_t scales, int group_size) {
+    if (qweight->dtype() != LLAISYS_DTYPE_I32) {
+        throw std::runtime_error("dequantize_awq_int4: qweight must be I32");
+    }
+    if (qzeros->dtype() != LLAISYS_DTYPE_I32) {
+        throw std::runtime_error("dequantize_awq_int4: qzeros must be I32");
+    }
+    if (out->dtype() != LLAISYS_DTYPE_F32) {
+        throw std::runtime_error("dequantize_awq_int4: output must be FP32");
+    }
+
+#ifdef ENABLE_NVIDIA_API
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+        return nvidia::dequantize_awq_int4(out, qweight, qzeros, scales, group_size);
+    }
+#endif
+
+    dequantize_awq_int4_cpu(out, qweight, qzeros, scales, group_size);
+}
+
 } // namespace llaisys::ops
