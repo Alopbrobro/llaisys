@@ -54,8 +54,9 @@ def hf_infer(
     return outputs[0].tolist(), result
 
 
-def load_llaisys_model(model_path, device_name):
-    model = llaisys.models.Qwen2(model_path, llaisys_device(device_name))
+def load_llaisys_model(model_path, device_name, max_seq_len=4096):
+    model = llaisys.models.Qwen2(model_path, llaisys_device(device_name),
+                                  max_seq_len=max_seq_len)
     return model
 
 
