@@ -89,12 +89,45 @@ class TPCoordinator:
         self.conns = {}  # rank → socket
         self._server_sock = None
 
+    def start_listening(self, retries: int = 30, retry_interval: float = 1.0):
+        """绑定端口并开始监听 (不阻塞等待连接).
+
+        在模型加载之前调用, 使 follower 在 rank 0 加载模型期间就能建立连接,
+        避免 follower 因为端口未监听而超时崩溃.
+
+        如果端口被前一次运行的残留进程占用, 会自动重试直到端口可用.
+        """
+        if self._server_sock is not None:
+            return
+
+        for attempt in range(retries):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("0.0.0.0", self.coord_port))
+                sock.listen(self.tp_size)
+                self._server_sock = sock
+                logger.info(f"Coordinator listening on port {self.coord_port}")
+                return
+            except OSError as e:
+                sock.close()
+                if attempt < retries - 1:
+                    logger.warning(
+                        f"Port {self.coord_port} in use ({e}), "
+                        f"retrying in {retry_interval}s ... ({attempt + 1}/{retries})"
+                    )
+                    time.sleep(retry_interval)
+                else:
+                    raise OSError(
+                        f"Failed to bind port {self.coord_port} after {retries} attempts. "
+                        f"A stale process may still be using it. "
+                        f"Try: fuser -k {self.coord_port}/tcp"
+                    ) from e
+
     def wait_for_followers(self, timeout: float = 300):
-        """监听并等待 tp_size-1 个 follower 连接."""
-        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_sock.bind(("0.0.0.0", self.coord_port))
-        self._server_sock.listen(self.tp_size)
+        """等待 tp_size-1 个 follower 连接."""
+        if self._server_sock is None:
+            self.start_listening()
         self._server_sock.settimeout(timeout)
 
         logger.info(f"Waiting for {self.tp_size - 1} followers on port {self.coord_port} ...")
@@ -372,19 +405,24 @@ def run_follower(model, tp_rank: int, coord_host: str, coord_port: int,
 
     logger.info(f"Connecting to rank 0 coordinator at {coord_host}:{coord_port} ...")
 
+    max_retries = 600  # 32B 模型首次 AWQ→FP16 转换可能需要 10+ 分钟
     sock = None
-    for attempt in range(60):
+    for attempt in range(max_retries):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
             sock.connect((coord_host, coord_port))
+            sock.settimeout(None)
             break
-        except ConnectionRefusedError:
+        except (ConnectionRefusedError, TimeoutError, OSError) as e:
             sock.close()
             sock = None
+            if attempt % 30 == 0:
+                logger.info(f"Waiting for coordinator ... attempt {attempt}/{max_retries} ({e})")
             time.sleep(1)
 
     if sock is None:
-        logger.error("Failed to connect to coordinator after 60 attempts")
+        logger.error(f"Failed to connect to coordinator after {max_retries} attempts")
         sys.exit(1)
 
     # 自报 rank
@@ -466,6 +504,13 @@ def main():
 
     logger.info(f"Starting TP worker: tp_size={args.tp_size}, tp_rank={args.tp_rank}")
 
+    # Rank 0: 在加载模型之前先启动 coordinator 监听,
+    # 这样 follower 在 rank 0 漫长的模型加载期间就能建立 TCP 连接.
+    coordinator = None
+    if args.server:
+        coordinator = TPCoordinator(args.tp_size, args.coord_port)
+        coordinator.start_listening()
+
     # 加载模型 (每个 rank 加载自己分片的权重)
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
@@ -491,8 +536,6 @@ def main():
         # ── Rank 0: Web Server + Coordinator ──
         logger.info("Running as rank 0 (server + coordinator)")
 
-        # 创建 coordinator 并等待 followers
-        coordinator = TPCoordinator(args.tp_size, args.coord_port)
         coordinator.wait_for_followers()
 
         # 加载 tokenizer
